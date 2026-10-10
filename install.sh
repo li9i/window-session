@@ -39,12 +39,14 @@ link "$REPO/share/bash-completion/completions/window-session" \
   "$COMPLETION_DIR/window-session"
 
 say "3. The timer"
-# reenable rather than enable, because the link systemd keeps for an enabled
-# timer points at the file the unit link resolved to when it was enabled. A
-# checkout that moved leaves that link pointing at nothing. The restart is what
-# makes a running timer take a schedule that changed since it started.
+# The link systemd keeps for an enabled timer points at the file the unit link
+# resolved to when it was enabled, so a checkout that moved leaves it pointing
+# at nothing. enable replaces it. reenable must not be used here: systemd takes
+# a unit link that points outside its own directories for one it made, and the
+# disable half of reenable deletes it. The restart is what makes a running
+# timer take a schedule that changed since it started.
 systemctl --user daemon-reload
-systemctl --user reenable "$TIMER"
+systemctl --user enable "$TIMER"
 systemctl --user restart "$TIMER"
 echo "  $TIMER records the open windows every minute"
 
