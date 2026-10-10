@@ -110,7 +110,7 @@ work                 2026-10-10 21:55:19   4 windows  the uploader fix, three te
 
 A name already taken is refused and nothing is stored. Delete the old state first, or store under another name. A restore closes nothing. It starts each terminal and file manager window of the state that is not open on the same folder, and every other window the state holds, even when a copy of that program is open already.
 
-What comes back is what comes back after a crash, which the next section lists. A browser opens its own most recent tabs, not the tabs it had when the state was stored.
+What comes back is what comes back after a crash, which the next section lists, and the browser tabs as well. Each tab that Chrome or Firefox had open and that is not open now opens again, in a new window with the other tabs of the window it was in. A tab open already, in any window, is left alone. When the browser is not running, the restore starts it to open those windows, and whatever the browser reopens by itself on start comes on top.
 
 Stored states live in the same file, under `stored`.
 
@@ -122,13 +122,14 @@ Back:
 * the workspace, size and position of each window, with `--place`
 * the directory the shell in each terminal window was in
 * the folder each file manager window was showing
+* for a stored state, the tabs Chrome and Firefox had open
 
 Not back, because it lives inside the program rather than in the window:
 
 * whatever was running in a terminal. The recorded command is printed as a reminder, not rerun. A `docker exec` into a container, or a Claude Code session, has to be started again by hand.
 * unsaved documents.
 
-Browsers and editors are left to their own restore. Chrome and Firefox are started once each and bring their own windows and tabs back themselves.
+After a crash, browsers and editors are left to their own restore. Chrome and Firefox are started once each and bring their own windows and tabs back themselves.
 
 A dry run prints all of it:
 
@@ -153,6 +154,8 @@ Four things are less obvious.
 **The directory a terminal was in.** Taken from the shell processes running under the terminal process. Those shells are paired with the terminal's windows in creation order, which is right for one shell per window. With tabs in play the pairing can slip a window. The command reported for each is its deepest descendant, which is what was on screen.
 
 **The folder a file manager was showing.** Caja publishes nothing about it: no window property, no open descriptor, and the title carries the folder name without the path. What it does hold is an inotify watch on the folder it displays, so `/proc/PID/fdinfo` gives the inode, and a scan of the home directory turns that inode into a path. Caja watches every ancestor of an open folder as well, so the window title has to match the folder name too. This is what tells eight folders named `prompts` apart. A cached path is only trusted while its inode is still watched, so navigating a window to another folder of the same name is noticed.
+
+**The tabs a browser has open.** Read from the browser's own session file when a state is stored, and again when it is restored, to see which tabs are open now. Chrome keeps a log of commands under `~/.config/google-chrome/*/Sessions/`, appending one each time a tab opens, moves, navigates or closes, so the open tabs are what is left after replaying the whole log. Firefox rewrites `sessionstore-backups/recovery.jsonlz4` in its profile every 15 seconds, JSON compressed with LZ4, which the script decompresses itself. A tab opened in Firefox in the last 15 seconds before a store can be missing from it. The two also differ in how they take a window of tabs. Chrome opens every URL after `--new-window` as the tabs of one new window. Firefox opens only the first, so each later tab goes as `--new-tab` in a command of its own, which lands in the window that was opened last.
 
 Placement, with `--place`, waits for the new windows to appear and matches them to the record by window class, in order. A move is measured against the window frame, which the window manager then adds back, and frame extents are reported in other units under display scaling, so each window is moved once, measured, and corrected by what it was out by.
 

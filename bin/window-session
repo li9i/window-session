@@ -69,12 +69,34 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
 
 STATE_FILE = os.environ.get(
     "WINDOW_SESSION_FILE", os.path.expanduser("~/.local/state/window-session.json"))
+
+# Where each browser keeps the tabs it has open, and the format of that file.
+# Chrome appends to a log of commands; Firefox rewrites a compressed JSON file
+# every 15 seconds while it runs.
+BROWSER_SESSIONS = {
+    "chrome": ("snss", ["~/.config/google-chrome/*/Sessions/Session_*"]),
+    "firefox": ("mozlz4", [
+        profiles + "/*/sessionstore-backups/recovery.jsonlz4"
+        for profiles in ("~/.mozilla/firefox",
+                         "~/snap/firefox/common/.mozilla/firefox")]),
+}
+
+# How each browser is told to open a window of tabs: the option for a new
+# window, and the option for a tab. With no tab option, every URL goes after
+# the window option in one command. Firefox opens only the first URL that way,
+# so each later one is sent as a command of its own, which lands in the window
+# that was opened last.
+BROWSER_OPEN = {
+    "chrome": ("--new-window", None),
+    "firefox": ("--new-window", "--new-tab"),
+}
 
 # Directories searched for an AppImage when the recorded path was a temporary
 # mount point that no longer exists.
@@ -92,6 +114,9 @@ SCAN_MAX_DEPTH = 16
 SCAN_SKIP_DIRS = {".cache", ".git", ".npm", ".rustup", "Trash", "__pycache__",
                   "build", "install", "log", "node_modules", "snap"}
 
+# A Firefox session file starts with a magic string and the decompressed size.
+MOZLZ4_HEADER_SIZE = 12
+
 # Programs that bring their own windows back, so launch them once and let them
 # do the rest.
 SELF_RESTORING = {"brave", "chrome", "chromium", "firefox", "google-chrome",
@@ -101,6 +126,17 @@ SHELLS = {"bash", "csh", "dash", "fish", "sh", "tcsh", "zsh"}
 
 # Part of the desktop itself. Never launched.
 SKIP_EXES = {"marco", "mate-panel", "mate-screensaver", "mate-session"}
+
+# A Chrome session file starts with a magic string and a version, and then
+# holds commands, each a size, a kind and a payload. These are the kinds that
+# say which tabs are open, in which window, in which order, and on which page.
+SNSS_HEADER_SIZE = 8
+SNSS_SET_TAB_WINDOW = 0
+SNSS_SET_TAB_INDEX = 2
+SNSS_UPDATE_NAVIGATION = 6
+SNSS_SET_SELECTED_NAVIGATION = 7
+SNSS_TAB_CLOSED = 16
+SNSS_WINDOW_CLOSED = 17
 
 # The name a state is stored under when none is given.
 STORED_NAME_FORMAT = "%Y-%m-%d_%H:%M:%S"
@@ -180,6 +216,15 @@ def appimage_for(name):
     return None
 
 
+def browser_commands(name, program, urls):
+    """The commands that open the URLs as the tabs of one new window."""
+    window_option, tab_option = BROWSER_OPEN[name]
+    if tab_option is None:
+        return [program + [window_option] + urls]
+    return ([program + [window_option, urls[0]]]
+            + [program + [tab_option, url] for url in urls[1:]])
+
+
 def change_key(windows):
     return sorted(
         (
@@ -242,7 +287,10 @@ def cmd_restore(args):
     print("%s record, %d windows, taken %s\n" % (
         record.get("name", "?"), len(windows), record.get("taken", "?")))
 
-    open_places, open_unplaced = open_window_counts(state)
+    open_windows = read_windows() or []
+    open_places, open_unplaced = open_window_counts(open_windows, state)
+    live_tabs = open_tabs(open_windows)
+    recorded_tabs = record.get("tabs", {})
     started = 0
     for group in group_by_process(windows):
         wm_class = group["wm_class"] or ""
@@ -254,6 +302,26 @@ def cmd_restore(args):
             continue
         name = os.path.basename(program[0])
         if name in SKIP_EXES:
+            continue
+
+        if name in recorded_tabs:
+            new_windows = missing_tabs(recorded_tabs[name],
+                                       live_tabs.get(name, []))
+            print("%s: %d tab(s) recorded, %d not open, open them in %d new "
+                  "window(s)" % (
+                      wm_class, sum(len(w) for w in recorded_tabs[name]),
+                      sum(len(w) for w in new_windows), len(new_windows)))
+            print("  %s" % " ".join(program))
+            for urls in new_windows:
+                print("  - window")
+                for url in urls:
+                    print("    %s" % url)
+            if args.go:
+                for urls in new_windows:
+                    for command in browser_commands(name, program, urls):
+                        if not spawn(command, None):
+                            print("  failed to start %s" % " ".join(command))
+                    started += 1
             continue
 
         self_restoring = name.lower() in SELF_RESTORING
@@ -360,6 +428,7 @@ def cmd_store(args):
         return 1
     record = new_record(read_windows(), state)
     record["description"] = args.description
+    record["tabs"] = open_tabs(record["windows"])
     stored[name] = record
     save_state(state)
     print("stored %d windows as %s" % (len(record["windows"]), name))
@@ -433,6 +502,41 @@ def load_state(path):
     return state
 
 
+def lz4_block(data):
+    """Decompress one LZ4 block, the format inside a Firefox session file."""
+    out = bytearray()
+    i = 0
+    while i < len(data):
+        token = data[i]
+        length, i = lz4_length(data, i + 1, token >> 4)
+        out += data[i:i + length]
+        i += length
+        if i >= len(data):
+            break
+        offset = data[i] | data[i + 1] << 8
+        length, i = lz4_length(data, i + 2, token & 15)
+        length += 4
+        start = len(out) - offset
+        if offset >= length:
+            out += out[start:start + length]
+        else:
+            for k in range(length):
+                out.append(out[start + k])
+    return bytes(out)
+
+
+def lz4_length(data, i, length):
+    """A length from an LZ4 token, extended by the bytes that follow it."""
+    if length == 15:
+        while True:
+            byte = data[i]
+            i += 1
+            length += byte
+            if byte != 255:
+                break
+    return length, i
+
+
 def main():
     os.environ.setdefault("DISPLAY", ":0")
     os.environ.setdefault("XAUTHORITY", os.path.expanduser("~/.Xauthority"))
@@ -483,6 +587,14 @@ def main():
     return args.func(args) or 0
 
 
+def missing_tabs(recorded, live):
+    """The recorded tabs that are not open now, kept in their windows."""
+    open_urls = {url for window in live for url in window}
+    windows = [[url for url in window if url not in open_urls]
+               for window in recorded]
+    return [window for window in windows if window]
+
+
 def missing_windows(windows, wm_class, open_places, open_unplaced,
                     start_all):
     """The recorded windows that the desktop lacks.
@@ -531,9 +643,26 @@ def new_record(windows, state):
     }
 
 
-def open_window_counts(state):
+def newest_file(patterns):
+    paths = [path for pattern in patterns
+             for path in glob.glob(os.path.expanduser(pattern))]
+    return max(paths, key=os.path.getmtime, default=None)
+
+
+def open_tabs(windows):
+    """The tabs open in each browser that has a window among the windows."""
+    readers = {"snss": read_snss, "mozlz4": read_mozlz4}
+    running = {program_name(window) for window in windows}
+    tabs = {}
+    for name, (kind, patterns) in BROWSER_SESSIONS.items():
+        path = newest_file(patterns)
+        if name in running and path:
+            tabs[name] = readers[kind](path)
+    return tabs
+
+
+def open_window_counts(windows, state):
     """Open windows counted by class and place, and by class for the rest."""
-    windows = read_windows() or []
     annotate_shell_dirs(windows)
     annotate_folders(windows, state)
     places = collections.Counter()
@@ -641,6 +770,65 @@ def read_client_list():
     if out is None or "not found" in out:
         return None
     return re.findall(r"0x[0-9a-fA-F]+", out)
+
+
+def read_mozlz4(path):
+    """The tabs of each open window in a Firefox session file."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    session = json.loads(lz4_block(data[MOZLZ4_HEADER_SIZE:]))
+    return [[tab["entries"][tab["index"] - 1]["url"]
+             for tab in window["tabs"] if tab["entries"]]
+            for window in session["windows"]]
+
+
+def read_snss(path):
+    """The tabs of each open window in a Chrome session file, in tab order.
+
+    The file is a log that Chrome appends to as tabs open, move, navigate and
+    close, so the open windows are what is left after replaying all of it.
+    Chrome may be halfway through writing the last command, which is skipped.
+    """
+    with open(path, "rb") as handle:
+        data = handle.read()
+    tabs = collections.defaultdict(lambda: {"navigations": {}})
+    closed_windows = set()
+    offset = SNSS_HEADER_SIZE
+    while offset + 2 < len(data):
+        size = struct.unpack_from("<H", data, offset)[0]
+        if offset + 2 + size > len(data):
+            break
+        kind = data[offset + 2]
+        body = data[offset + 3:offset + 2 + size]
+        offset += 2 + size
+        if kind == SNSS_SET_TAB_WINDOW:
+            window, tab = struct.unpack_from("<ii", body)
+            tabs[tab]["window"] = window
+        elif kind == SNSS_SET_TAB_INDEX:
+            tab, index = struct.unpack_from("<ii", body)
+            tabs[tab]["index"] = index
+        elif kind == SNSS_UPDATE_NAVIGATION:
+            tab, index, length = struct.unpack_from("<iii", body, 4)
+            tabs[tab]["navigations"][index] = body[16:16 + length].decode(
+                "utf-8", "replace")
+        elif kind == SNSS_SET_SELECTED_NAVIGATION:
+            tab, index = struct.unpack_from("<ii", body)
+            tabs[tab]["selected"] = index
+        elif kind == SNSS_TAB_CLOSED:
+            tabs.pop(struct.unpack_from("<i", body)[0], None)
+        elif kind == SNSS_WINDOW_CLOSED:
+            closed_windows.add(struct.unpack_from("<i", body)[0])
+
+    windows = {}
+    for tab in tabs.values():
+        navigations = tab["navigations"]
+        if (not navigations or "window" not in tab
+                or tab["window"] in closed_windows):
+            continue
+        url = navigations.get(tab.get("selected"),
+                              navigations[max(navigations)])
+        windows.setdefault(tab["window"], []).append((tab.get("index", 0), url))
+    return [[url for _, url in sorted(window)] for window in windows.values()]
 
 
 def read_windows():
