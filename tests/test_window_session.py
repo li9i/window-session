@@ -227,10 +227,10 @@ class RestoreTest(WindowSessionTest):
                             [self.file_manager("/b")])
         self.assertEqual(self.spawned, [])
 
-    def test_a_stored_program_starts_even_when_a_copy_is_open(self):
+    def test_a_stored_program_open_already_is_not_started_twice(self):
         app = self.window("App", "app")
         self.restore_stored([app], [app])
-        self.assertEqual(len(self.spawned), 1)
+        self.assertEqual(self.spawned, [])
 
     def test_a_crash_record_does_not_start_an_open_program_twice(self):
         app = self.window("App", "app")

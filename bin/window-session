@@ -357,8 +357,7 @@ def cmd_restore(args):
         self_restoring = name.lower() in SELF_RESTORING
         targets = group["windows"][:1] if self_restoring else group["windows"]
         to_start = missing_windows(targets, wm_class, open_places,
-                                   open_unplaced,
-                                   bool(args.name) and not self_restoring)
+                                   open_unplaced)
         already = len(targets) - len(to_start)
         print("%s: %d window(s) recorded, %d already open, start %d%s" % (
             wm_class, len(group["windows"]), already, len(to_start),
@@ -640,14 +639,13 @@ def missing_tabs(recorded, live):
     return [window for window in windows if window]
 
 
-def missing_windows(windows, wm_class, open_places, open_unplaced,
-                    start_all):
+def missing_windows(windows, wm_class, open_places, open_unplaced):
     """The recorded windows that the desktop lacks.
 
     A window with a place, the folder of a terminal or of a file manager, is
     there when a window of its class is open on that place. A window with no
-    place is matched by count within its class, unless start_all asks for
-    every one of them. Each open window is matched once.
+    place is matched by count within its class. Each open window is matched
+    once.
     """
     missing = []
     for window in windows:
@@ -655,7 +653,7 @@ def missing_windows(windows, wm_class, open_places, open_unplaced,
         key = (wm_class, place)
         if place is not None and open_places[key]:
             open_places[key] -= 1
-        elif place is None and not start_all and open_unplaced[wm_class]:
+        elif place is None and open_unplaced[wm_class]:
             open_unplaced[wm_class] -= 1
         else:
             missing.append(window)

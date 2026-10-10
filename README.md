@@ -108,7 +108,7 @@ work            2026-10-10 22:24:00   3 windows  the uploader fix, three termina
 wise_ramanujan  2026-10-10 22:24:00   3 windows
 ```
 
-A name already taken is refused and nothing is stored. Delete the old state first, or store under another name. A restore closes nothing. It starts each terminal and file manager window of the state that is not open on the same folder, and every other window the state holds, even when a copy of that program is open already.
+A name already taken is refused and nothing is stored. Delete the old state first, or store under another name. A restore closes nothing. It starts each terminal and file manager window of the state that is not open on the same folder. Any other program is started for as many windows as the state holds beyond those open already, so a program that is open is not started a second time.
 
 What comes back is what comes back after a crash, which the next section lists, and the browser tabs as well. Each tab that Chrome or Firefox had open and that is not open now opens again, in a new window with the other tabs of the window it was in. A tab open already, in any window, is left alone. When the browser is not running, the restore starts it to open those windows, and whatever the browser reopens by itself on start comes on top.
 
@@ -147,7 +147,7 @@ The window list comes from `_NET_CLIENT_LIST` on the root window, and each windo
 
 Four things are less obvious.
 
-**One process, many windows.** A terminal, a file manager and a browser each serve all their windows from one process, so counting processes would bring back one window where there were five. Restore matches windows instead. A terminal counts as open when a terminal is open in the same directory, and a file manager when one shows the same folder. Any other window is matched by count within its window class, so after a crash only the difference is started. A [stored state](#stored-states) skips that count and starts every other window it holds, whatever is open.
+**One process, many windows.** A terminal, a file manager and a browser each serve all their windows from one process, so counting processes would bring back one window where there were five. Restore matches windows instead. A terminal counts as open when a terminal is open in the same directory, and a file manager when one shows the same folder. Any other window is matched by count within its window class, so only the difference is started.
 
 **Stale program paths.** A snap records a path carrying its revision, `/snap/firefox/8736/...`, and an AppImage records the temporary mount it was running from, `/tmp/.mount_.../obsidian`. Neither exists after a restart. The recorded path is used when it still exists, then the program name on `PATH`, then an AppImage of that name in `~/Applications`, `~/Downloads`, `~/Downloads/programs`, `~/Desktop`, `~/bin`, `~/.local/bin` or `~/opt`.
 
