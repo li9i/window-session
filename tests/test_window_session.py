@@ -109,6 +109,24 @@ class StoredStatesTest(WindowSessionTest):
         self.assertEqual(len(stored), 1)
         self.assertIn(stored[0].split()[0], out)
 
+    def test_a_state_stored_without_a_name_gets_adjective_and_surname(self):
+        _, out = self.run_cli("store")
+        name = out.split()[-1]
+        adjective, surname = name.split("_")
+        self.assertIn(adjective, self.ws.NAME_ADJECTIVES)
+        self.assertIn(surname, self.ws.NAME_SURNAMES)
+
+    def test_a_made_up_name_already_taken_is_not_used_again(self):
+        self.ws.NAME_ADJECTIVES = ["calm"]
+        self.ws.NAME_SURNAMES = ["curie", "turing"]
+        self.run_cli("store")
+        code, _ = self.run_cli("store")
+        self.assertEqual(code, 0)
+        _, out = self.run_cli("list")
+        names = sorted(l.split()[0]
+                       for l in out.split("stored\n", 1)[1].splitlines())
+        self.assertEqual(names, ["calm_curie", "calm_turing"])
+
     def test_show_prints_the_description_under_the_name(self):
         self.run_cli("store", "work", "--description", "three terminals")
         _, out = self.run_cli("show", "work")

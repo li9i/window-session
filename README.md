@@ -91,7 +91,7 @@ The two records follow the desktop on their own. A stored state is taken by hand
 
 ```bash
 window-session store work --description "the uploader fix, three terminals"
-window-session store                       # named after the date and time
+window-session store                       # named like calm_curie
 window-session show work
 window-session restore work --go --place
 window-session delete work
@@ -104,8 +104,8 @@ current           2026-10-10 21:46:59   4 windows
 previous session  2026-10-10 11:51:35   5 windows  <- used by restore
 
 stored
-work                 2026-10-10 21:55:19   4 windows  the uploader fix, three terminals
-2026-10-10_21:55:19  2026-10-10 21:55:19   4 windows
+work            2026-10-10 22:24:00   3 windows  the uploader fix, three terminals
+wise_ramanujan  2026-10-10 22:24:00   3 windows
 ```
 
 A name already taken is refused and nothing is stored. Delete the old state first, or store under another name. A restore closes nothing. It starts each terminal and file manager window of the state that is not open on the same folder, and every other window the state holds, even when a copy of that program is open already.
