@@ -399,6 +399,7 @@ def cmd_restore(args):
 
 
 def cmd_save(args):
+    prune_journals()
     windows = read_windows()
     if windows is None:
         return 0  # no X display reachable, stay quiet
@@ -844,6 +845,21 @@ def program_name(window):
     if name.startswith("python") and len(cmdline) > 1:
         name = os.path.basename(cmdline[1])
     return name
+
+
+def prune_journals():
+    """Delete the journals of shells that are no longer running.
+
+    A journal is named after the process id and the start time of its shell,
+    so a process id that came back for another process does not keep it. The
+    files that hand a restored shell its commands have other names and stay.
+    """
+    for path in glob.glob(os.path.join(JOURNAL_DIR, "*-*")):
+        pid, _, start = os.path.basename(path).partition("-")
+        if not (pid.isdigit() and start.isdigit()):
+            continue
+        if process_starttime(int(pid)) != int(start):
+            os.remove(path)
 
 
 def read_client_list():

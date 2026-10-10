@@ -425,6 +425,19 @@ class TerminalHistoryTest(WindowSessionTest):
         with open(path) as handle:
             self.assertEqual(handle.read().splitlines(), ["ls", "make"])
 
+    def test_the_timer_deletes_the_journals_of_shells_that_are_gone(self):
+        pid = os.getpid()
+        os.makedirs(self.ws.JOURNAL_DIR)
+        live = "%d-%d" % (pid, self.ws.process_starttime(pid))
+        gone = "%d-1" % pid
+        handed = "restore-abc"
+        for name in (live, gone, handed):
+            open(os.path.join(self.ws.JOURNAL_DIR, name), "w").close()
+        self.desktop = [self.terminal("ls")]
+        self.run_cli("save")
+        self.assertEqual(sorted(os.listdir(self.ws.JOURNAL_DIR)),
+                         sorted([live, handed]))
+
     def test_a_new_command_alone_renews_the_crash_record(self):
         self.desktop = [self.terminal("ls")]
         self.run_cli("save")

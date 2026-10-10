@@ -128,7 +128,7 @@ If `~/.bashrc` already times commands with a `DEBUG` trap that compares each com
 
 The hook writes each command into a journal of its own shell under `~/.local/state/window-session/journals/`, named after the process id and the start time of the shell. Every record takes the journal of each terminal window along, and a new command is enough to renew the crash record at the next tick of the timer. On restore, the commands go into a file that the new shell reads at its first prompt and then deletes. Bash reads its own history file only after `~/.bashrc`, which is why the commands wait for the first prompt: read any earlier, the shared history would land on top of them.
 
-What stays as it was: a new window starts with the shared history, which each window adds to only when it closes. A command that starts with a space, or that `HISTCONTROL` keeps out of the history, stays out of the journal too. The text that was on the screen does not come back: MATE's terminal keeps it in encrypted files whose key never leaves its memory. And the journals are never deleted, one small file for each shell that ran.
+What stays as it was: a new window starts with the shared history, which each window adds to only when it closes. A command that starts with a space, or that `HISTCONTROL` keeps out of the history, stays out of the journal too. The text that was on the screen does not come back: MATE's terminal keeps it in encrypted files whose key never leaves its memory. The timer deletes the journal of a shell once the shell is gone. By then its commands are in the records, which are what a restore reads.
 
 ## What comes back and what does not
 
