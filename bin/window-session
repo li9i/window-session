@@ -1016,20 +1016,6 @@ def save_state(state):
     os.replace(temporary, STATE_FILE)
 
 
-@contextlib.contextmanager
-def state_lock():
-    """Let one command at a time read, change and write the state file.
-
-    Without it, a timer save that read the file before a store wrote it would
-    write its own copy over the stored state, and two writers would share the
-    one temporary file.
-    """
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE + ".lock", "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        yield
-
-
 def session_start_time():
     """When the desktop session started, or None when that cannot be told."""
     for name in ("mate-session", "marco"):
@@ -1094,6 +1080,20 @@ def spawn(cmdline, cwd, env=None):
     return True
 
 
+@contextlib.contextmanager
+def state_lock():
+    """Let one command at a time read, change and write the state file.
+
+    Without it, a timer save that read the file before a store wrote it would
+    write its own copy over the stored state, and two writers would share the
+    one temporary file.
+    """
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE + ".lock", "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
 def unknown_name(state, name):
     """Say so when a name is given and no state is stored under it."""
     if name and name not in state.get("stored", {}):
@@ -1109,11 +1109,6 @@ def wanted_record(args):
     if args.previous:
         return "previous session"
     return None
-
-
-def window_place(window):
-    """The folder a file manager shows, or the one a terminal's shell is in."""
-    return window.get("folder") or window.get("shell_cwd")
 
 
 def window_class(wid):
@@ -1183,6 +1178,11 @@ def window_info(wid):
     }
     window.update(process_info(pid))
     return window
+
+
+def window_place(window):
+    """The folder a file manager shows, or the one a terminal's shell is in."""
+    return window.get("folder") or window.get("shell_cwd")
 
 
 if __name__ == "__main__":
