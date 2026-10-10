@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+"""Record the open X11 windows and relaunch them after a crash or a reboot.
+
+Everything is kept in one file, ~/.local/state/window-session.json, rewritten
+in place. It holds two records. "current" is the desktop as it stands, renewed
+every time the window list changes. "previous session" is what "current" held
+when the desktop session it described came to an end, which after a crash is
+the record worth restoring, because by then the live record describes the near
+empty desktop you have just logged into.
+
+Two extras are worked out while the programs are still alive, because the
+information is gone once they die:
+
+  Terminal windows get the working directory of the shell running in them.
+  Several windows share one terminal process, so the shells are paired with
+  the windows in creation order. With tabs in play the pairing can slip.
+
+  File manager windows get the folder they show. The folder is not published
+  on the window, so it is found through the inotify watch the file manager
+  holds on the folder it displays: the watch gives an inode, and a scan of the
+  home directory turns that inode into a path. Resolved paths are cached in
+  the same file.
+
+Usage:
+  window-session save [--force]
+      Renew the current record. Without --force, nothing is written unless the
+      window list changed.
+
+  window-session list
+      The two records, their age and their size.
+
+  window-session show [FILE] [--current] [--previous]
+      Print a record in readable form.
+
+  window-session restore [FILE] [--go] [--place] [--current] [--previous]
+      Print what would be relaunched. With --go, launch the programs that are
+      missing. With --place, also try to put the new windows back on their
+      recorded workspace and geometry.
+
+With neither --current nor --previous, both commands take the previous session
+when the current record belongs to the session running now, and the current
+record otherwise. That is the one you want after a crash. FILE reads a copy of
+the state file kept somewhere else, which is how a restore is tried out without
+disturbing the desktop.
+
+What comes back: the programs, how many windows each had, their workspace,
+their size, a terminal's directory and a file manager's folder. Not the state
+inside them. Browsers and editors restore their own tabs and documents. A
+terminal comes back as a fresh shell, so the recorded window titles and the
+commands that were running are printed as a reminder.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+STATE_FILE = os.environ.get(
+    "WINDOW_SESSION_FILE", os.path.expanduser("~/.local/state/window-session.json"))
+
+# Directories searched for an AppImage when the recorded path was a temporary
+# mount point that no longer exists.
+APPIMAGE_DIRS = ["~/Applications", "~/Downloads", "~/Downloads/programs",
+                 "~/Desktop", "~/bin", "~/.local/bin", "~/opt"]
+
+# File managers open a folder given as the first argument.
+FILE_MANAGERS = {"caja", "nautilus", "nemo", "pcmanfm", "thunar"}
+
+# How long to wait before looking again for a folder that could not be found.
+FOLDER_RETRY_SECONDS = 3600
+
+# Bounds for the scan that turns an inode into a path.
+SCAN_MAX_DEPTH = 16
+SCAN_SKIP_DIRS = {".cache", ".git", ".npm", ".rustup", "Trash", "__pycache__",
+                  "build", "install", "log", "node_modules", "snap"}
+
+# Programs that bring their own windows back, so launch them once and let them
+# do the rest.
+SELF_RESTORING = {"brave", "chrome", "chromium", "firefox", "google-chrome",
+                  "microsoft-edge", "opera", "vivaldi"}
+
+SHELLS = {"bash", "csh", "dash", "fish", "sh", "tcsh", "zsh"}
+
+# Part of the desktop itself. Never launched.
+SKIP_EXES = {"marco", "mate-panel", "mate-screensaver", "mate-session"}
+
+# Window types that are furniture rather than applications.
+SKIP_TYPES = {
+    "_NET_WM_WINDOW_TYPE_DESKTOP",
+    "_NET_WM_WINDOW_TYPE_DOCK",
+    "_NET_WM_WINDOW_TYPE_SPLASH",
+    "_NET_WM_WINDOW_TYPE_TOOLBAR",
+}
+
+# Terminals that take their starting directory on the command line.
+TERMINAL_CWD_OPTION = {
+    "gnome-terminal": "--working-directory",
+    "mate-terminal": "--working-directory",
+    "terminator": "--working-directory",
+    "tilix": "--working-directory",
+    "xfce4-terminal": "--default-working-directory",
+}
+
+
+def annotate_folders(windows, state):
+    """Record the folder each file manager window is showing."""
+    wanted = [w for w in windows
+              if program_name(w) in FILE_MANAGERS and w.get("title")]
+    if not wanted:
+        return
+    watched = {}
+    for pid in {w["pid"] for w in wanted if w.get("pid")}:
+        watched[pid] = inotify_inodes(pid)
+
+    cache = state.setdefault("folder_cache", {})
+    pending = set()
+    for window in wanted:
+        title = window["title"]
+        inodes = watched.get(window.get("pid"), set())
+        entry = cache.get(title) or {}
+        path = entry.get("path")
+        if path and os.path.isdir(path) and inode_of(path) in inodes:
+            window["folder"] = path
+            continue
+        if not path and time.time() - entry.get("checked", 0) < FOLDER_RETRY_SECONDS:
+            continue
+        pending.add(title)
+
+    if pending:
+        all_inodes = set().union(*watched.values()) if watched else set()
+        found = resolve_folders(pending, all_inodes)
+        for title in pending:
+            cache[title] = {"path": found.get(title), "checked": time.time()}
+        for window in wanted:
+            if window["title"] in found:
+                window["folder"] = found[window["title"]]
+
+
+def annotate_shell_dirs(windows):
+    """Record the directory of the shell running in each terminal window."""
+    by_pid = {}
+    for window in windows:
+        if program_name(window) in TERMINAL_CWD_OPTION and window.get("pid"):
+            by_pid.setdefault(window["pid"], []).append(window)
+    for pid, group in by_pid.items():
+        for window, shell in zip(group, shell_children(pid)):
+            window["shell_cwd"] = shell["cwd"]
+            window["shell_command"] = shell["command"]
+
+
+def appimage_for(name):
+    for directory in APPIMAGE_DIRS:
+        pattern = os.path.join(os.path.expanduser(directory), "*.AppImage")
+        for path in sorted(glob.glob(pattern)):
+            if name.lower() in os.path.basename(path).lower():
+                return path
+    return None
+
+
+def change_key(windows):
+    return sorted(
+        (
+            w.get("wm_class") or "",
+            " ".join(w.get("cmdline") or []),
+            w.get("folder") or "",
+            w.get("shell_cwd") or "",
+            str(w.get("desktop")),
+            json.dumps(w.get("geometry"), sort_keys=True),
+        )
+        for w in windows
+    )
+
+
+def cmd_list(args):
+    state = load_state(None)
+    default = pick_record(state, None)
+    for name in ("current", "previous session"):
+        record = state.get(record_key(name))
+        if not record:
+            print("%-17s nothing recorded" % name)
+            continue
+        print("%-17s %s  %2d windows%s" % (
+            name, record.get("taken", "?"), len(record.get("windows", [])),
+            "  <- used by restore" if record is default else ""))
+    return 0
+
+
+def cmd_restore(args):
+    state = load_state(args.file)
+    record = pick_record(state, wanted_record(args))
+    if not record:
+        print("nothing recorded yet in %s" % (args.file or STATE_FILE))
+        return 1
+    windows = record.get("windows", [])
+    print("%s record, %d windows, taken %s\n" % (
+        record.get("name", "?"), len(windows), record.get("taken", "?")))
+
+    open_now = current_class_counts()
+    started = 0
+    for group in group_by_process(windows):
+        wm_class = group["wm_class"] or ""
+        program = resolve_program(group)
+        if not program:
+            print("%s: no runnable command recorded" % wm_class)
+            for window in group["windows"]:
+                print_window(window)
+            continue
+        name = os.path.basename(program[0])
+        if name in SKIP_EXES:
+            continue
+
+        self_restoring = name.lower() in SELF_RESTORING
+        targets = group["windows"][:1] if self_restoring else group["windows"]
+        already = open_now.get(wm_class, 0)
+        to_start = targets[already:]
+        print("%s: %d window(s) recorded, %d open now, start %d%s" % (
+            wm_class, len(group["windows"]), already, len(to_start),
+            "  (restores its own windows and tabs)" if self_restoring else ""))
+        print("  %s" % " ".join(program))
+        for window in group["windows"]:
+            print_window(window)
+
+        if args.go:
+            for window in to_start:
+                command = program + launch_extras(window)
+                cwd = window.get("shell_cwd") or group["cwd"]
+                if not (cwd and os.path.isdir(cwd)):
+                    cwd = None
+                if spawn(command, cwd):
+                    started += 1
+                    open_now[wm_class] = open_now.get(wm_class, 0) + 1
+                else:
+                    print("  failed to start %s" % " ".join(command))
+
+    if not args.go:
+        print("dry run. add --go to launch, and --place to also restore "
+              "workspaces and window sizes.")
+        return 0
+    print("started %d window(s)" % started)
+    if args.place and started:
+        print("waiting for the windows to appear, then placing them")
+        time.sleep(8)
+        place_windows(windows)
+    return 0
+
+
+def cmd_save(args):
+    windows = read_windows()
+    if windows is None:
+        return 0  # no X display reachable, stay quiet
+    if not windows:
+        return 0  # never record an empty desktop over a good record
+    state = load_state(None)
+    annotate_shell_dirs(windows)
+    annotate_folders(windows, state)
+
+    started = session_start_time()
+    current = state.get("current")
+    if current and started and current.get("session_start") != started:
+        # The session that record described has ended. Keep it, because after a
+        # crash it is the one worth restoring.
+        state["previous_session"] = current
+        current = None
+    if current and not args.force:
+        if change_key(current.get("windows", [])) == change_key(windows):
+            return 0
+
+    state["current"] = {
+        "taken": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "host": os.uname().nodename,
+        "session_start": started,
+        "windows": windows,
+    }
+    save_state(state)
+    if args.verbose:
+        print("recorded %d windows in %s" % (len(windows), STATE_FILE))
+    return 0
+
+
+def cmd_show(args):
+    state = load_state(args.file)
+    record = pick_record(state, wanted_record(args))
+    if not record:
+        print("nothing recorded yet in %s" % (args.file or STATE_FILE))
+        return 1
+    print("%s record, taken %s\n" % (
+        record.get("name", "?"), record.get("taken", "?")))
+    for window in record.get("windows", []):
+        desktop = window.get("desktop")
+        geometry = window.get("geometry") or {}
+        print("workspace %-4s %-22s %s" % (
+            "all" if desktop == -1 else ("?" if desktop is None else desktop + 1),
+            window.get("wm_class") or "?",
+            window.get("title") or "(no title)"))
+        print("               %sx%s at %s,%s   %s" % (
+            geometry.get("width", "?"), geometry.get("height", "?"),
+            geometry.get("x", "?"), geometry.get("y", "?"),
+            " ".join(window.get("cmdline") or []) or "(command line unknown)"))
+        where = window.get("folder") or window.get("shell_cwd")
+        if where:
+            print("               in %s" % where)
+        if window.get("shell_command"):
+            print("               was running %s" % window["shell_command"])
+    return 0
+
+
+def current_class_counts():
+    counts = {}
+    for window in read_windows() or []:
+        name = window.get("wm_class")
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def group_by_process(windows):
+    groups = {}
+    order = []
+    for window in windows:
+        key = (window.get("wm_class") or "",
+               tuple(window.get("cmdline") or []),
+               window.get("cwd") or "")
+        if key not in groups:
+            groups[key] = {
+                "wm_class": window.get("wm_class"),
+                "cmdline": list(window.get("cmdline") or []),
+                "cwd": window.get("cwd"),
+                "exe": window.get("exe"),
+                "windows": [],
+            }
+            order.append(key)
+        groups[key]["windows"].append(window)
+    return [groups[key] for key in order]
+
+
+def inode_of(path):
+    try:
+        return os.stat(path).st_ino
+    except OSError:
+        return None
+
+
+def inotify_inodes(pid):
+    """Inodes the process is watching, one per open folder among others."""
+    inodes = set()
+    for path in glob.glob("/proc/%d/fdinfo/*" % pid):
+        try:
+            with open(path) as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        for match in re.finditer(r"^inotify wd:\S+ ino:(\S+)", text, re.M):
+            inodes.add(int(match.group(1), 16))
+    return inodes
+
+
+def launch_extras(window):
+    """Command line arguments that put a window back where it was."""
+    name = program_name(window)
+    if name in FILE_MANAGERS and window.get("folder"):
+        return [window["folder"]]
+    option = TERMINAL_CWD_OPTION.get(name)
+    if option and window.get("shell_cwd"):
+        return ["%s=%s" % (option, window["shell_cwd"])]
+    return []
+
+
+def load_state(path):
+    try:
+        with open(path or STATE_FILE) as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    for name in ("current", "previous session"):
+        record = state.get(record_key(name))
+        if record:
+            record["name"] = name
+    return state
+
+
+def main():
+    os.environ.setdefault("DISPLAY", ":0")
+    os.environ.setdefault("XAUTHORITY", os.path.expanduser("~/.Xauthority"))
+
+    parser = argparse.ArgumentParser(
+        description="Record and relaunch the open desktop windows.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    save = subparsers.add_parser("save", help="renew the current record")
+    save.add_argument("--force", action="store_true", help="write even if unchanged")
+    save.add_argument("--verbose", action="store_true")
+    save.set_defaults(func=cmd_save)
+
+    listing = subparsers.add_parser("list", help="the two records")
+    listing.set_defaults(func=cmd_list)
+
+    for name, help_text, function in (("show", "print a record", cmd_show),
+                                      ("restore", "relaunch a record", cmd_restore)):
+        command = subparsers.add_parser(name, help=help_text)
+        command.add_argument("file", nargs="?", help="read another state file")
+        command.add_argument("--current", action="store_true",
+                             help="the desktop as last seen")
+        command.add_argument("--previous", action="store_true",
+                             help="the session that ended")
+        command.set_defaults(func=function)
+        if name == "restore":
+            command.add_argument("--go", action="store_true", help="actually launch")
+            command.add_argument("--place", action="store_true",
+                                 help="also restore workspace and geometry")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return 0
+    return args.func(args) or 0
+
+
+def move_window(wid, x, y):
+    """Move a window so that it ends up where it was recorded.
+
+    A move is measured against the window frame, which the window manager adds
+    back on, so ask once, see where the window landed, and correct the offset.
+    """
+    run(["xdotool", "windowmove", wid, str(x), str(y)])
+    landed = window_geometry(wid)
+    if not landed:
+        return
+    offset_x, offset_y = landed["x"] - x, landed["y"] - y
+    if offset_x or offset_y:
+        run(["xdotool", "windowmove", wid, str(x - offset_x), str(y - offset_y)])
+
+
+def pick_record(state, wanted):
+    """The record to work from.
+
+    Asked for one by name, that one. Otherwise the previous session, as long
+    as the current record belongs to the session running now, which is the
+    case after a crash.
+    """
+    current = state.get("current")
+    previous = state.get("previous_session")
+    if wanted:
+        return current if wanted == "current" else previous
+    started = session_start_time()
+    if current and started and current.get("session_start") == started:
+        return previous or current
+    return current or previous
+
+
+def place_windows(windows):
+    used = set()
+    current = read_client_list() or []
+    for window in windows:
+        wm_class = window.get("wm_class")
+        geometry = window.get("geometry") or {}
+        if not wm_class or not geometry:
+            continue
+        target = None
+        for wid in current:
+            if wid not in used and window_class(wid) == wm_class:
+                target = wid
+                break
+        if not target:
+            continue
+        used.add(target)
+        desktop = window.get("desktop")
+        if desktop is not None and desktop >= 0:
+            run(["xdotool", "set_desktop_for_window", target, str(desktop)])
+        run(["xdotool", "windowsize", target,
+             str(geometry["width"]), str(geometry["height"])])
+        move_window(target, geometry["x"], geometry["y"])
+
+
+def print_window(window):
+    print("  - %s" % (window.get("title") or "(no title)"))
+    where = window.get("folder") or window.get("shell_cwd")
+    if where:
+        print("    in %s" % where)
+    if window.get("shell_command"):
+        print("    was running %s" % window["shell_command"])
+
+
+def process_info(pid):
+    info = {"cmdline": None, "cwd": None, "exe": None}
+    if not pid:
+        return info
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as handle:
+            parts = [p.decode("utf-8", "replace")
+                     for p in handle.read().split(b"\0") if p]
+        info["cmdline"] = parts or None
+    except OSError:
+        pass
+    for key in ("cwd", "exe"):
+        try:
+            info[key] = os.readlink("/proc/%d/%s" % (pid, key))
+        except OSError:
+            pass
+    return info
+
+
+def process_starttime(pid):
+    """Process start time in clock ticks since boot, so newer means larger."""
+    try:
+        with open("/proc/%d/stat" % pid) as handle:
+            fields = handle.read().rpartition(")")[2].split()
+        return int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def program_name(window):
+    cmdline = window.get("cmdline") or []
+    if not cmdline:
+        return ""
+    name = os.path.basename(cmdline[0])
+    if name.startswith("python") and len(cmdline) > 1:
+        name = os.path.basename(cmdline[1])
+    return name
+
+
+def read_client_list():
+    out = run(["xprop", "-root", "_NET_CLIENT_LIST"])
+    if out is None or "not found" in out:
+        return None
+    return re.findall(r"0x[0-9a-fA-F]+", out)
+
+
+def read_windows():
+    ids = read_client_list()
+    if ids is None:
+        return None
+    windows = []
+    for wid in ids:
+        window = window_info(wid)
+        if window:
+            windows.append(window)
+    return windows
+
+
+def record_key(name):
+    return name.replace(" ", "_")
+
+
+def resolve_folders(titles, inodes):
+    """Find the folder behind each window title by matching watched inodes."""
+    found = {}
+    home = os.path.expanduser("~")
+    if titles and os.path.basename(home) in titles and inode_of(home) in inodes:
+        found[os.path.basename(home)] = home
+    for root, dirs, _ in os.walk(home):
+        if root.count(os.sep) - home.count(os.sep) >= SCAN_MAX_DEPTH:
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if d not in SCAN_SKIP_DIRS]
+        for name in dirs:
+            if name not in titles or name in found:
+                continue
+            path = os.path.join(root, name)
+            if not os.path.islink(path) and inode_of(path) in inodes:
+                found[name] = path
+        if len(found) == len(titles):
+            break
+    return found
+
+
+def resolve_program(group):
+    """Turn a recorded command line into something runnable today.
+
+    Snap paths carry a revision number and AppImages run from a temporary
+    mount point, so both go stale. Fall back to the name on PATH, then to an
+    AppImage on disk.
+    """
+    cmdline = group.get("cmdline") or []
+    if not cmdline:
+        return None
+    first = cmdline[0]
+    stale = first.startswith("/tmp/.mount_") or first.startswith("/snap/")
+    if not stale and (os.path.isabs(first) and os.path.exists(first)):
+        return list(cmdline)
+    name = os.path.basename(first)
+    found = shutil.which(name)
+    if found:
+        return [found] + list(cmdline[1:])
+    for candidate in (name, group.get("wm_class") or ""):
+        if candidate:
+            appimage = appimage_for(candidate)
+            if appimage:
+                return [appimage] + list(cmdline[1:])
+    return None
+
+
+def run(cmd):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def save_state(state):
+    """Write the state file whole, so a crash cannot leave half a record."""
+    for record in (state.get("current"), state.get("previous_session")):
+        if record:
+            record.pop("name", None)
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    temporary = STATE_FILE + ".new"
+    with open(temporary, "w") as handle:
+        json.dump(state, handle, indent=2)
+    os.replace(temporary, STATE_FILE)
+
+
+def session_start_time():
+    """When the desktop session started, or None when that cannot be told."""
+    for name in ("mate-session", "marco"):
+        out = run(["pgrep", "-u", str(os.getuid()), "-x", name])
+        if not out:
+            continue
+        for pid in out.split():
+            try:
+                return os.stat("/proc/%s" % pid).st_mtime
+            except OSError:
+                continue
+    return None
+
+
+def shell_children(pid):
+    """Shells running under a terminal process, oldest first.
+
+    The command reported for each shell is its deepest descendant, which is
+    what the operator was actually looking at.
+    """
+    children = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry) as handle:
+                fields = handle.read().rpartition(")")[2].split()
+            parent = int(fields[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(parent, []).append(int(entry))
+
+    shells = []
+    for child in children.get(pid, []):
+        info = process_info(child)
+        cmdline = info["cmdline"] or []
+        if not cmdline or os.path.basename(cmdline[0]) not in SHELLS:
+            continue
+        deepest, current = cmdline, child
+        while children.get(current):
+            current = children[current][-1]
+            found = process_info(current)["cmdline"]
+            if found:
+                deepest = found
+        shells.append({
+            "pid": child,
+            "cwd": info["cwd"],
+            "command": " ".join(deepest),
+        })
+    return sorted(shells, key=lambda s: process_starttime(s["pid"]))
+
+
+def spawn(cmdline, cwd):
+    try:
+        with open(os.devnull, "wb") as sink:
+            subprocess.Popen(cmdline, cwd=cwd, stdout=sink, stderr=sink,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return False
+    time.sleep(1.5)
+    return True
+
+
+def wanted_record(args):
+    if args.current:
+        return "current"
+    if args.previous:
+        return "previous session"
+    return None
+
+
+def window_class(wid):
+    out = run(["xprop", "-id", wid, "WM_CLASS"])
+    if not out:
+        return None
+    names = re.findall(r'"([^"]*)"', out)
+    return names[-1] if names else None
+
+
+def window_geometry(wid):
+    out = run(["xdotool", "getwindowgeometry", "--shell", wid])
+    if not out:
+        return None
+    values = {}
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        if value.strip().lstrip("-").isdigit():
+            values[key.strip().lower()] = int(value)
+    if not {"x", "y", "width", "height"} <= set(values):
+        return None
+    return {k: values[k] for k in ("x", "y", "width", "height")}
+
+
+def window_info(wid):
+    out = run(["xprop", "-id", wid, "_NET_WM_WINDOW_TYPE", "_NET_WM_PID",
+               "_NET_WM_DESKTOP", "WM_CLASS", "_NET_WM_NAME", "WM_NAME"])
+    if not out:
+        return None
+
+    props = {}
+    for line in out.splitlines():
+        name = line.partition("(")[0].strip()
+        props[name] = line.split("=", 1)[1].strip() if "=" in line else ""
+
+    window_type = props.get("_NET_WM_WINDOW_TYPE", "")
+    if any(skip in window_type for skip in SKIP_TYPES):
+        return None
+
+    pid = None
+    match = re.search(r"\d+", props.get("_NET_WM_PID", ""))
+    if match:
+        pid = int(match.group())
+
+    desktop = None
+    match = re.search(r"0x[0-9a-fA-F]+|\d+", props.get("_NET_WM_DESKTOP", ""))
+    if match:
+        value = int(match.group(), 0)
+        desktop = -1 if value >= 0xFFFFFFFF else value
+
+    names = re.findall(r'"([^"]*)"', props.get("WM_CLASS", ""))
+    title = None
+    for key in ("_NET_WM_NAME", "WM_NAME"):
+        found = re.findall(r'"(.*)"', props.get(key, ""))
+        if found:
+            title = found[0]
+            break
+
+    window = {
+        "id": wid,
+        "title": title,
+        "wm_class": names[-1] if names else None,
+        "desktop": desktop,
+        "type": window_type,
+        "pid": pid,
+        "geometry": window_geometry(wid),
+    }
+    window.update(process_info(pid))
+    return window
+
+
+if __name__ == "__main__":
+    sys.exit(main())

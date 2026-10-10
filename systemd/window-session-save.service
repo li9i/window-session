@@ -1,0 +1,6 @@
+[Unit]
+Description=Snapshot the open desktop windows
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/window-session save
