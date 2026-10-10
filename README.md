@@ -81,7 +81,7 @@ The second one is there because one record on its own cannot survive a crash. Th
 
 That is also how `show` and `restore` choose when told neither `--current` nor `--previous`. They take the previous session while the current record belongs to the session running now, which is the case after a crash, and the current record otherwise. `list` marks the one they would take.
 
-Two more rules protect the record. Nothing is written when the X display cannot be reached, and nothing is written when no windows are open, so a session in the act of dying cannot spoil its own record. Writes go to a temporary file and are renamed over the old one, so a crash halfway through a write cannot leave half a record either.
+Two more rules protect the record. Nothing is written when the X display cannot be reached, and nothing is written when no windows are open, so a session in the act of dying cannot spoil its own record. Writes go to a temporary file and are renamed over the old one, so a crash halfway through a write cannot leave half a record either. Only one command at a time reads, changes and writes the file, under a lock on `window-session.json.lock` beside it, so a store made while the timer saves is not written over.
 
 The resolved file manager folders are cached in the same file, under `folder_cache`.
 

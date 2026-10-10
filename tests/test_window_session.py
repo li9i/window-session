@@ -10,6 +10,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import multiprocessing
 import os
 import struct
 import sys
@@ -156,6 +157,22 @@ class StoredStatesTest(WindowSessionTest):
             self.assertIn("wrok", out)
         _, out = self.run_cli("list")
         self.assertIn("work", out)
+
+    def test_stores_made_while_saves_run_are_all_kept(self):
+        def saves():
+            for _ in range(300):
+                self.run_cli("save", "--force")
+
+        workers = [multiprocessing.Process(target=saves) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for i in range(60):
+            self.run_cli("store", "s%d" % i)
+        for worker in workers:
+            worker.join()
+        _, out = self.run_cli("list", "--names")
+        self.assertEqual(len(out.split()), 60)
+        self.assertEqual([worker.exitcode for worker in workers], [0, 0])
 
     def test_the_timer_save_keeps_the_stored_states(self):
         self.run_cli("store", "work")
