@@ -135,5 +135,61 @@ class StoredStatesTest(WindowSessionTest):
         self.assertTrue(out.startswith("work record, 2 windows"))
 
 
+class RestoreTest(WindowSessionTest):
+
+    def terminal(self, folder):
+        return self.window("Mate-terminal", "mate-terminal", shell_cwd=folder)
+
+    def file_manager(self, folder):
+        return self.window("Caja", "caja", folder=folder)
+
+    def restore_stored(self, stored, open_now):
+        self.desktop = stored
+        self.run_cli("store", "work")
+        self.desktop = open_now
+        self.run_cli("restore", "work", "--go")
+
+    def restore_crash_record(self, recorded, open_now):
+        self.desktop = recorded
+        self.run_cli("save")
+        self.desktop = open_now
+        self.run_cli("restore", "--current", "--go")
+
+    def test_a_terminal_open_elsewhere_does_not_hold_back_a_stored_one(self):
+        self.restore_stored([self.terminal("/b")], [self.terminal("/a")])
+        self.assertEqual(len(self.spawned), 1)
+        self.assertIn("--working-directory=/b", self.spawned[0])
+
+    def test_a_terminal_open_in_the_same_folder_is_not_started_again(self):
+        self.restore_stored([self.terminal("/b")], [self.terminal("/b")])
+        self.assertEqual(self.spawned, [])
+
+    def test_a_file_manager_on_another_folder_does_not_hold_back_one(self):
+        self.restore_stored([self.file_manager("/b")],
+                            [self.file_manager("/a")])
+        self.assertEqual(len(self.spawned), 1)
+        self.assertIn("/b", self.spawned[0])
+
+    def test_a_file_manager_on_the_same_folder_is_not_started_again(self):
+        self.restore_stored([self.file_manager("/b")],
+                            [self.file_manager("/b")])
+        self.assertEqual(self.spawned, [])
+
+    def test_a_stored_program_starts_even_when_a_copy_is_open(self):
+        app = self.window("App", "app")
+        self.restore_stored([app], [app])
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_a_crash_record_does_not_start_an_open_program_twice(self):
+        app = self.window("App", "app")
+        self.restore_crash_record([app], [app])
+        self.assertEqual(self.spawned, [])
+
+    def test_a_crash_record_matches_terminals_by_folder_too(self):
+        self.restore_crash_record([self.terminal("/b")],
+                                  [self.terminal("/a")])
+        self.assertEqual(len(self.spawned), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

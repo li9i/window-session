@@ -63,6 +63,7 @@ commands that were running are printed as a reminder.
 """
 
 import argparse
+import collections
 import glob
 import json
 import os
@@ -241,7 +242,7 @@ def cmd_restore(args):
     print("%s record, %d windows, taken %s\n" % (
         record.get("name", "?"), len(windows), record.get("taken", "?")))
 
-    open_now = current_class_counts()
+    open_places, open_unplaced = open_window_counts(state)
     started = 0
     for group in group_by_process(windows):
         wm_class = group["wm_class"] or ""
@@ -257,9 +258,11 @@ def cmd_restore(args):
 
         self_restoring = name.lower() in SELF_RESTORING
         targets = group["windows"][:1] if self_restoring else group["windows"]
-        already = open_now.get(wm_class, 0)
-        to_start = targets[already:]
-        print("%s: %d window(s) recorded, %d open now, start %d%s" % (
+        to_start = missing_windows(targets, wm_class, open_places,
+                                   open_unplaced,
+                                   bool(args.name) and not self_restoring)
+        already = len(targets) - len(to_start)
+        print("%s: %d window(s) recorded, %d already open, start %d%s" % (
             wm_class, len(group["windows"]), already, len(to_start),
             "  (restores its own windows and tabs)" if self_restoring else ""))
         print("  %s" % " ".join(program))
@@ -274,7 +277,6 @@ def cmd_restore(args):
                     cwd = None
                 if spawn(command, cwd):
                     started += 1
-                    open_now[wm_class] = open_now.get(wm_class, 0) + 1
                 else:
                     print("  failed to start %s" % " ".join(command))
 
@@ -362,15 +364,6 @@ def cmd_store(args):
     save_state(state)
     print("stored %d windows as %s" % (len(record["windows"]), name))
     return 0
-
-
-def current_class_counts():
-    counts = {}
-    for window in read_windows() or []:
-        name = window.get("wm_class")
-        if name:
-            counts[name] = counts.get(name, 0) + 1
-    return counts
 
 
 def group_by_process(windows):
@@ -490,6 +483,28 @@ def main():
     return args.func(args) or 0
 
 
+def missing_windows(windows, wm_class, open_places, open_unplaced,
+                    start_all):
+    """The recorded windows that the desktop lacks.
+
+    A window with a place, the folder of a terminal or of a file manager, is
+    there when a window of its class is open on that place. A window with no
+    place is matched by count within its class, unless start_all asks for
+    every one of them. Each open window is matched once.
+    """
+    missing = []
+    for window in windows:
+        place = window_place(window)
+        key = (wm_class, place)
+        if place is not None and open_places[key]:
+            open_places[key] -= 1
+        elif place is None and not start_all and open_unplaced[wm_class]:
+            open_unplaced[wm_class] -= 1
+        else:
+            missing.append(window)
+    return missing
+
+
 def move_window(wid, x, y):
     """Move a window so that it ends up where it was recorded.
 
@@ -514,6 +529,22 @@ def new_record(windows, state):
         "host": os.uname().nodename,
         "windows": windows,
     }
+
+
+def open_window_counts(state):
+    """Open windows counted by class and place, and by class for the rest."""
+    windows = read_windows() or []
+    annotate_shell_dirs(windows)
+    annotate_folders(windows, state)
+    places = collections.Counter()
+    unplaced = collections.Counter()
+    for window in windows:
+        place = window_place(window)
+        if place is None:
+            unplaced[window.get("wm_class") or ""] += 1
+        else:
+            places[(window.get("wm_class") or "", place)] += 1
+    return places, unplaced
 
 
 def pick_record(state, wanted):
@@ -769,6 +800,11 @@ def wanted_record(args):
     if args.previous:
         return "previous session"
     return None
+
+
+def window_place(window):
+    """The folder a file manager shows, or the one a terminal's shell is in."""
+    return window.get("folder") or window.get("shell_cwd")
 
 
 def window_class(wid):

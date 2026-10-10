@@ -108,7 +108,7 @@ work                 2026-10-10 21:55:19   4 windows  the uploader fix, three te
 2026-10-10_21:55:19  2026-10-10 21:55:19   4 windows
 ```
 
-A name already taken is refused and nothing is stored. Delete the old state first, or store under another name. A restore starts what the stored state has and the desktop lacks, and closes nothing, the same as a restore after a crash.
+A name already taken is refused and nothing is stored. Delete the old state first, or store under another name. A restore closes nothing. It starts each terminal and file manager window of the state that is not open on the same folder, and every other window the state holds, even when a copy of that program is open already.
 
 What comes back is what comes back after a crash, which the next section lists. A browser opens its own most recent tabs, not the tabs it had when the state was stored.
 
@@ -133,7 +133,7 @@ Browsers and editors are left to their own restore. Chrome and Firefox are start
 A dry run prints all of it:
 
 ```
-Mate-terminal: 4 window(s) recorded, 0 open now, start 4
+Mate-terminal: 4 window(s) recorded, 0 already open, start 4
   /usr/bin/mate-terminal
   - Fix the retry loop in the upload client
     in /home/alex/projects/uploader
@@ -146,7 +146,7 @@ The window list comes from `_NET_CLIENT_LIST` on the root window, and each windo
 
 Four things are less obvious.
 
-**One process, many windows.** A terminal, a file manager and a browser each serve all their windows from one process, so counting processes would bring back one window where there were five. Restore counts windows per window class instead, compares that with what is open now, and starts the difference.
+**One process, many windows.** A terminal, a file manager and a browser each serve all their windows from one process, so counting processes would bring back one window where there were five. Restore matches windows instead. A terminal counts as open when a terminal is open in the same directory, and a file manager when one shows the same folder. Any other window is matched by count within its window class, so after a crash only the difference is started. A [stored state](#stored-states) skips that count and starts every other window it holds, whatever is open.
 
 **Stale program paths.** A snap records a path carrying its revision, `/snap/firefox/8736/...`, and an AppImage records the temporary mount it was running from, `/tmp/.mount_.../obsidian`. Neither exists after a restart. The recorded path is used when it still exists, then the program name on `PATH`, then an AppImage of that name in `~/Applications`, `~/Downloads`, `~/Downloads/programs`, `~/Desktop`, `~/bin`, `~/.local/bin` or `~/opt`.
 
