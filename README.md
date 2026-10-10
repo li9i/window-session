@@ -163,7 +163,13 @@ Two routes that look right and are not. MATE's session manager has no save metho
 
 ## Checks after a change
 
-There is no test suite. After touching anything, run:
+The tests fake the desktop and the processes, so they run anywhere, from the repository root:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+They cannot see a real desktop, so after touching anything, also run:
 
 ```bash
 window-session save --force --verbose
