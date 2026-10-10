@@ -127,6 +127,12 @@ class StoredStatesTest(WindowSessionTest):
                        for l in out.split("stored\n", 1)[1].splitlines())
         self.assertEqual(names, ["calm_curie", "calm_turing"])
 
+    def test_list_names_prints_only_the_stored_names(self):
+        self.run_cli("store", "work")
+        self.run_cli("store", "play")
+        _, out = self.run_cli("list", "--names")
+        self.assertEqual(out.splitlines(), ["work", "play"])
+
     def test_show_prints_the_description_under_the_name(self):
         self.run_cli("store", "work", "--description", "three terminals")
         _, out = self.run_cli("show", "work")

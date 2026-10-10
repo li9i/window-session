@@ -30,8 +30,9 @@ Usage:
       Renew the current record. Without --force, nothing is written unless the
       window list changed.
 
-  window-session list
+  window-session list [--names]
       The two records, their age and their size, then the stored states.
+      With --names, only the names of the stored states, one to a line.
 
   window-session store [NAME] [--description TEXT]
       Store the desktop as it stands under NAME. Left out, NAME is made up
@@ -276,6 +277,10 @@ def cmd_delete(args):
 
 def cmd_list(args):
     state = load_state(None)
+    if args.names:
+        for name in state.get("stored", {}):
+            print(name)
+        return 0
     default = pick_record(state, None)
     for name in ("current", "previous session"):
         record = state.get(record_key(name))
@@ -585,6 +590,8 @@ def main():
 
     listing = subparsers.add_parser(
         "list", help="the two records and the stored states")
+    listing.add_argument("--names", action="store_true",
+                         help="only the names of the stored states")
     listing.set_defaults(func=cmd_list)
 
     store = subparsers.add_parser("store",

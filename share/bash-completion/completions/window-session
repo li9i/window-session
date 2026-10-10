@@ -9,6 +9,9 @@ _window_session_completion() {
     fi
 
     case "${COMP_WORDS[1]}" in
+        list)
+            opts+=" --names"
+            ;;
         restore)
             opts+=" --current --file --go --place --previous"
             ;;
@@ -27,6 +30,8 @@ _window_session_completion() {
         COMPREPLY=($(compgen -W "$opts" -- "$cur"))
     elif [[ ${COMP_WORDS[COMP_CWORD-1]} == --file ]]; then
         _filedir
+    elif [[ ${COMP_WORDS[1]} =~ ^(delete|restore|show)$ ]]; then
+        COMPREPLY=($(compgen -W "$(window-session list --names)" -- "$cur"))
     fi
 }
 
