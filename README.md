@@ -2,12 +2,13 @@
 
 `window-session` records which windows are open and puts them back after a crash or a reboot.
 
-Everything lives in one file, `~/.local/state/window-session.json`, checked every minute by a systemd user timer, and rewritten only when the window list has changed. It holds one entry per window: the program, the title, the workspace, the size and position, the directory a terminal was in and the folder a file manager was showing. After a crash, `window-session restore` reads it and starts what is missing.
+Everything lives in one file, `~/.local/state/window-session.json`, checked every minute by a systemd user timer, and rewritten only when the window list has changed. It holds one entry per window: the program, the title, the workspace, the size and position, the directory a terminal was in and the folder a file manager was showing. After a crash, `window-session restore` reads it and starts what is missing. States stored by hand under a name go in the same file and stay there until deleted.
 
 * [Install](#install)
 * [What it needs](#what-it-needs)
 * [Commands](#commands)
 * [The two records](#the-two-records)
+* [Stored states](#stored-states)
 * [What comes back and what does not](#what-comes-back-and-what-does-not)
 * [How it works](#how-it-works)
 * [Checks after a change](#checks-after-a-change)
@@ -34,7 +35,7 @@ It was written for and is used on Ubuntu MATE. One part depends on that: the rec
 ## Commands
 
 ```bash
-window-session list                    # the two records, their age and size
+window-session list                    # the two records and the stored states
 window-session show                    # what was open, in readable form
 window-session restore                 # a dry run: what it would start
 window-session restore --go            # start it
@@ -48,12 +49,12 @@ window-session save            # writes nothing if the window list did not chang
 window-session save --force    # writes anyway
 ```
 
-`show` and `restore` take `--current` or `--previous` to name a record rather than let the tool choose, and a path to read another state file:
+`show` and `restore` take the name of a [stored state](#stored-states), or `--current` or `--previous` to name a record rather than let the tool choose, and `--file` to read another state file:
 
 ```bash
 window-session show --current
 window-session restore --previous --go --place
-window-session show /tmp/window-session-test.json
+window-session show --file /tmp/window-session-test.json
 ```
 
 The timer is a normal systemd user unit:
@@ -67,7 +68,7 @@ systemctl --user enable --now window-session-save.timer    # record again
 
 ## The two records
 
-The file holds two records, and `list` shows both:
+The timer keeps two records, and `list` shows both:
 
 ```
 current           2026-08-11 12:50:33  15 windows
@@ -76,13 +77,42 @@ previous session  2026-08-11 09:00:00  15 windows  <- used by restore
 
 `current` is the desktop as it stands. `previous session` is what `current` held when the desktop session it described came to an end.
 
-The second one is there because one record on its own cannot survive a crash. The desktop you log into afterwards is nearly empty, and the timer would write that over the only thing worth restoring within a minute. So each record carries the start time of the session it was taken in, and the first save under a new session moves the old record aside instead of overwriting it. Nothing accumulates: there is one file, and one record per side.
+The second one is there because one record on its own cannot survive a crash. The desktop you log into afterwards is nearly empty, and the timer would write that over the only thing worth restoring within a minute. So each record carries the start time of the session it was taken in, and the first save under a new session moves the old record aside instead of overwriting it. The timer accumulates nothing: there is one file, and one record per side.
 
 That is also how `show` and `restore` choose when told neither `--current` nor `--previous`. They take the previous session while the current record belongs to the session running now, which is the case after a crash, and the current record otherwise. `list` marks the one they would take.
 
 Two more rules protect the record. Nothing is written when the X display cannot be reached, and nothing is written when no windows are open, so a session in the act of dying cannot spoil its own record. Writes go to a temporary file and are renamed over the old one, so a crash halfway through a write cannot leave half a record either.
 
 The resolved file manager folders are cached in the same file, under `folder_cache`.
+
+## Stored states
+
+The two records follow the desktop on their own. A stored state is taken by hand and stays until it is deleted, so a desktop stored today can be put back days and any number of reboots later.
+
+```bash
+window-session store work --description "the uploader fix, three terminals"
+window-session store                       # named after the date and time
+window-session show work
+window-session restore work --go --place
+window-session delete work
+```
+
+`list` shows the stored states under the two records, each with its description:
+
+```
+current           2026-10-10 21:46:59   4 windows
+previous session  2026-10-10 11:51:35   5 windows  <- used by restore
+
+stored
+work                 2026-10-10 21:55:19   4 windows  the uploader fix, three terminals
+2026-10-10_21:55:19  2026-10-10 21:55:19   4 windows
+```
+
+A name already taken is refused and nothing is stored. Delete the old state first, or store under another name. A restore starts what the stored state has and the desktop lacks, and closes nothing, the same as a restore after a crash.
+
+What comes back is what comes back after a crash, which the next section lists. A browser opens its own most recent tabs, not the tabs it had when the state was stored.
+
+Stored states live in the same file, under `stored`.
 
 ## What comes back and what does not
 
@@ -146,6 +176,14 @@ export WINDOW_SESSION_FILE=/tmp/window-session-test.json
 cp ~/.local/state/window-session.json $WINDOW_SESSION_FILE
 # edit the copy down to one window, close that window, then
 window-session restore --current --go --place
+```
+
+To check stored states against the copy, store one, find it in the list with its description, and delete it again:
+
+```bash
+window-session store check --description "a test"
+window-session list
+window-session delete check
 ```
 
 To check the hand-over between sessions, set `session_start` in the copy's `current` record to something else and save. The old record must appear as `previous session`, and a second save must leave it alone rather than promote again:

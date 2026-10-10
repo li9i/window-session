@@ -8,6 +8,10 @@ when the desktop session it described came to an end, which after a crash is
 the record worth restoring, because by then the live record describes the near
 empty desktop you have just logged into.
 
+Beside those two it holds the states stored by hand, each under a name and with
+a description if one was given. They stay until deleted, so a desktop stored
+today can be put back days and many reboots later.
+
 Two extras are worked out while the programs are still alive, because the
 information is gone once they die:
 
@@ -27,21 +31,29 @@ Usage:
       window list changed.
 
   window-session list
-      The two records, their age and their size.
+      The two records, their age and their size, then the stored states.
 
-  window-session show [FILE] [--current] [--previous]
+  window-session store [NAME] [--description TEXT]
+      Store the desktop as it stands under NAME, or under the date and time
+      when NAME is left out. A name already taken is refused.
+
+  window-session delete NAME
+      Delete a stored state.
+
+  window-session show [NAME] [--current] [--previous] [--file FILE]
       Print a record in readable form.
 
-  window-session restore [FILE] [--go] [--place] [--current] [--previous]
+  window-session restore [NAME] [--go] [--place] [--current] [--previous]
+                         [--file FILE]
       Print what would be relaunched. With --go, launch the programs that are
       missing. With --place, also try to put the new windows back on their
       recorded workspace and geometry.
 
-With neither --current nor --previous, both commands take the previous session
-when the current record belongs to the session running now, and the current
-record otherwise. That is the one you want after a crash. FILE reads a copy of
-the state file kept somewhere else, which is how a restore is tried out without
-disturbing the desktop.
+NAME picks a stored state. With none of NAME, --current and --previous, both
+commands take the previous session when the current record belongs to the
+session running now, and the current record otherwise. That is the one you want
+after a crash. --file reads a copy of the state file kept somewhere else, which
+is how a restore is tried out without disturbing the desktop.
 
 What comes back: the programs, how many windows each had, their workspace,
 their size, a terminal's directory and a file manager's folder. Not the state
@@ -88,6 +100,11 @@ SHELLS = {"bash", "csh", "dash", "fish", "sh", "tcsh", "zsh"}
 
 # Part of the desktop itself. Never launched.
 SKIP_EXES = {"marco", "mate-panel", "mate-screensaver", "mate-session"}
+
+# The name a state is stored under when none is given.
+STORED_NAME_FORMAT = "%Y-%m-%d_%H:%M:%S"
+
+TAKEN_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # Window types that are furniture rather than applications.
 SKIP_TYPES = {
@@ -176,6 +193,21 @@ def change_key(windows):
     )
 
 
+def chosen_record(state, args):
+    """The stored state named on the command line, or else pick_record's."""
+    if args.name:
+        return state["stored"][args.name]
+    return pick_record(state, wanted_record(args))
+
+
+def cmd_delete(args):
+    state = load_state(None)
+    del state["stored"][args.name]
+    save_state(state)
+    print("deleted %s" % args.name)
+    return 0
+
+
 def cmd_list(args):
     state = load_state(None)
     default = pick_record(state, None)
@@ -187,12 +219,21 @@ def cmd_list(args):
         print("%-17s %s  %2d windows%s" % (
             name, record.get("taken", "?"), len(record.get("windows", [])),
             "  <- used by restore" if record is default else ""))
+
+    stored = state.get("stored", {})
+    if stored:
+        print("\nstored")
+    width = max((len(name) for name in stored), default=0)
+    for name, record in stored.items():
+        print(("%-*s  %s  %2d windows  %s" % (
+            width, name, record["taken"], len(record["windows"]),
+            record.get("description") or "")).rstrip())
     return 0
 
 
 def cmd_restore(args):
     state = load_state(args.file)
-    record = pick_record(state, wanted_record(args))
+    record = chosen_record(state, args)
     if not record:
         print("nothing recorded yet in %s" % (args.file or STATE_FILE))
         return 1
@@ -256,8 +297,7 @@ def cmd_save(args):
     if not windows:
         return 0  # never record an empty desktop over a good record
     state = load_state(None)
-    annotate_shell_dirs(windows)
-    annotate_folders(windows, state)
+    record = new_record(windows, state)
 
     started = session_start_time()
     current = state.get("current")
@@ -270,12 +310,8 @@ def cmd_save(args):
         if change_key(current.get("windows", [])) == change_key(windows):
             return 0
 
-    state["current"] = {
-        "taken": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "host": os.uname().nodename,
-        "session_start": started,
-        "windows": windows,
-    }
+    record["session_start"] = started
+    state["current"] = record
     save_state(state)
     if args.verbose:
         print("recorded %d windows in %s" % (len(windows), STATE_FILE))
@@ -284,12 +320,15 @@ def cmd_save(args):
 
 def cmd_show(args):
     state = load_state(args.file)
-    record = pick_record(state, wanted_record(args))
+    record = chosen_record(state, args)
     if not record:
         print("nothing recorded yet in %s" % (args.file or STATE_FILE))
         return 1
-    print("%s record, taken %s\n" % (
+    print("%s record, taken %s" % (
         record.get("name", "?"), record.get("taken", "?")))
+    if record.get("description"):
+        print(record["description"])
+    print()
     for window in record.get("windows", []):
         desktop = window.get("desktop")
         geometry = window.get("geometry") or {}
@@ -306,6 +345,22 @@ def cmd_show(args):
             print("               in %s" % where)
         if window.get("shell_command"):
             print("               was running %s" % window["shell_command"])
+    return 0
+
+
+def cmd_store(args):
+    state = load_state(None)
+    stored = state.setdefault("stored", {})
+    name = args.name or time.strftime(STORED_NAME_FORMAT)
+    if name in stored:
+        print("%s is taken. Delete it first, or store under another name."
+              % name)
+        return 1
+    record = new_record(read_windows(), state)
+    record["description"] = args.description
+    stored[name] = record
+    save_state(state)
+    print("stored %d windows as %s" % (len(record["windows"]), name))
     return 0
 
 
@@ -380,6 +435,8 @@ def load_state(path):
         record = state.get(record_key(name))
         if record:
             record["name"] = name
+    for name, record in state.get("stored", {}).items():
+        record["name"] = name
     return state
 
 
@@ -396,13 +453,26 @@ def main():
     save.add_argument("--verbose", action="store_true")
     save.set_defaults(func=cmd_save)
 
-    listing = subparsers.add_parser("list", help="the two records")
+    listing = subparsers.add_parser(
+        "list", help="the two records and the stored states")
     listing.set_defaults(func=cmd_list)
+
+    store = subparsers.add_parser("store",
+                                  help="store the desktop as it stands")
+    store.add_argument("name", nargs="?",
+                       help="the date and time when left out")
+    store.add_argument("-d", "--description", help="what the state is for")
+    store.set_defaults(func=cmd_store)
+
+    delete = subparsers.add_parser("delete", help="delete a stored state")
+    delete.add_argument("name")
+    delete.set_defaults(func=cmd_delete)
 
     for name, help_text, function in (("show", "print a record", cmd_show),
                                       ("restore", "relaunch a record", cmd_restore)):
         command = subparsers.add_parser(name, help=help_text)
-        command.add_argument("file", nargs="?", help="read another state file")
+        command.add_argument("name", nargs="?", help="a stored state")
+        command.add_argument("--file", help="read another state file")
         command.add_argument("--current", action="store_true",
                              help="the desktop as last seen")
         command.add_argument("--previous", action="store_true",
@@ -433,6 +503,17 @@ def move_window(wid, x, y):
     offset_x, offset_y = landed["x"] - x, landed["y"] - y
     if offset_x or offset_y:
         run(["xdotool", "windowmove", wid, str(x - offset_x), str(y - offset_y)])
+
+
+def new_record(windows, state):
+    """A record of the windows, with what only the live programs can tell."""
+    annotate_shell_dirs(windows)
+    annotate_folders(windows, state)
+    return {
+        "taken": time.strftime(TAKEN_FORMAT),
+        "host": os.uname().nodename,
+        "windows": windows,
+    }
 
 
 def pick_record(state, wanted):
@@ -607,7 +688,9 @@ def run(cmd):
 
 def save_state(state):
     """Write the state file whole, so a crash cannot leave half a record."""
-    for record in (state.get("current"), state.get("previous_session")):
+    records = [state.get("current"), state.get("previous_session")]
+    records += state.get("stored", {}).values()
+    for record in records:
         if record:
             record.pop("name", None)
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)

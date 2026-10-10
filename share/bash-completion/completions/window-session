@@ -1,27 +1,31 @@
 _window_session_completion() {
     local cur=${COMP_WORDS[COMP_CWORD]}
+    local commands="delete list restore save show store"
     local opts="--help -h"
 
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=($(compgen -W "list restore save show $opts" -- "$cur"))
+        COMPREPLY=($(compgen -W "$commands $opts" -- "$cur"))
         return 0
     fi
 
     case "${COMP_WORDS[1]}" in
         restore)
-            opts+=" --current --go --place --previous"
+            opts+=" --current --file --go --place --previous"
             ;;
         save)
             opts+=" --force --verbose"
             ;;
         show)
-            opts+=" --current --previous"
+            opts+=" --current --file --previous"
+            ;;
+        store)
+            opts+=" --description -d"
             ;;
     esac
 
     if [[ $cur == -* ]]; then
         COMPREPLY=($(compgen -W "$opts" -- "$cur"))
-    elif [[ ${COMP_WORDS[1]} == restore || ${COMP_WORDS[1]} == show ]]; then
+    elif [[ ${COMP_WORDS[COMP_CWORD-1]} == --file ]]; then
         _filedir
     fi
 }
