@@ -1,0 +1,2 @@
+# python bytecode, written when the tests import themselves
+__pycache__/
