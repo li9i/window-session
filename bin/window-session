@@ -266,6 +266,8 @@ def chosen_record(state, args):
 
 def cmd_delete(args):
     state = load_state(None)
+    if unknown_name(state, args.name):
+        return 1
     del state["stored"][args.name]
     save_state(state)
     print("deleted %s" % args.name)
@@ -297,6 +299,8 @@ def cmd_list(args):
 
 def cmd_restore(args):
     state = load_state(args.file)
+    if unknown_name(state, args.name):
+        return 1
     record = chosen_record(state, args)
     if not record:
         print("nothing recorded yet in %s" % (args.file or STATE_FILE))
@@ -408,6 +412,8 @@ def cmd_save(args):
 
 def cmd_show(args):
     state = load_state(args.file)
+    if unknown_name(state, args.name):
+        return 1
     record = chosen_record(state, args)
     if not record:
         print("nothing recorded yet in %s" % (args.file or STATE_FILE))
@@ -1007,6 +1013,15 @@ def spawn(cmdline, cwd):
         return False
     time.sleep(1.5)
     return True
+
+
+def unknown_name(state, name):
+    """Say so when a name is given and no state is stored under it."""
+    if name and name not in state.get("stored", {}):
+        print("no state is stored as %s. window-session list shows them all."
+              % name)
+        return True
+    return False
 
 
 def wanted_record(args):

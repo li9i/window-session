@@ -142,6 +142,15 @@ class StoredStatesTest(WindowSessionTest):
         names = [l.split()[0] for l in out.split("stored\n", 1)[1].splitlines()]
         self.assertEqual(names, ["play"])
 
+    def test_a_mistyped_name_is_named_back_and_nothing_happens(self):
+        self.run_cli("store", "work")
+        for command in ("restore", "show", "delete"):
+            code, out = self.run_cli(command, "wrok")
+            self.assertEqual(code, 1)
+            self.assertIn("wrok", out)
+        _, out = self.run_cli("list")
+        self.assertIn("work", out)
+
     def test_the_timer_save_keeps_the_stored_states(self):
         self.run_cli("store", "work")
         self.desktop = self.desktop[:1]
