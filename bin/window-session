@@ -77,6 +77,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 STATE_FILE = os.environ.get(
@@ -102,6 +103,12 @@ BROWSER_OPEN = {
     "chrome": ("--new-window", None),
     "firefox": ("--new-window", "--new-tab"),
 }
+
+# Where the bash hook in share/window-session/history.bash keeps a journal of
+# the commands typed in each shell, named after its process id and start time,
+# and the variable that hands a restored shell the commands of its window.
+JOURNAL_DIR = os.path.expanduser("~/.local/state/window-session/journals")
+HISTORY_ENV = "WINDOW_SESSION_HISTORY"
 
 # Directories searched for an AppImage when the recorded path was a temporary
 # mount point that no longer exists.
@@ -226,6 +233,7 @@ def annotate_shell_dirs(windows):
         for window, shell in zip(group, shell_children(pid)):
             window["shell_cwd"] = shell["cwd"]
             window["shell_command"] = shell["command"]
+            window["shell_history"] = journal_lines(shell["pid"])
 
 
 def appimage_for(name):
@@ -253,6 +261,7 @@ def change_key(windows):
             " ".join(w.get("cmdline") or []),
             w.get("folder") or "",
             w.get("shell_cwd") or "",
+            str(len(w.get("shell_history") or [])),
             str(w.get("desktop")),
             json.dumps(w.get("geometry"), sort_keys=True),
         )
@@ -372,7 +381,7 @@ def cmd_restore(args):
                 cwd = window.get("shell_cwd") or group["cwd"]
                 if not (cwd and os.path.isdir(cwd)):
                     cwd = None
-                if spawn(command, cwd):
+                if spawn(command, cwd, history_env(window)):
                     started += 1
                 else:
                     print("  failed to start %s" % " ".join(command))
@@ -447,6 +456,9 @@ def cmd_show(args):
             print("               in %s" % where)
         if window.get("shell_command"):
             print("               was running %s" % window["shell_command"])
+        if window.get("shell_history"):
+            print("               with %d commands of its own"
+                  % len(window["shell_history"]))
     return 0
 
 
@@ -488,6 +500,21 @@ def group_by_process(windows):
     return [groups[key] for key in order]
 
 
+def history_env(window):
+    """The environment that hands a restored shell the commands of its window.
+
+    The commands go into a file of their own, which the bash hook reads at the
+    first prompt of the new shell and then deletes.
+    """
+    if not window.get("shell_history"):
+        return None
+    os.makedirs(JOURNAL_DIR, exist_ok=True)
+    handle, path = tempfile.mkstemp(prefix="restore-", dir=JOURNAL_DIR)
+    with os.fdopen(handle, "w") as out:
+        out.write("\n".join(window["shell_history"]) + "\n")
+    return dict(os.environ, **{HISTORY_ENV: path})
+
+
 def inode_of(path):
     try:
         return os.stat(path).st_ino
@@ -507,6 +534,15 @@ def inotify_inodes(pid):
         for match in re.finditer(r"^inotify wd:\S+ ino:(\S+)", text, re.M):
             inodes.add(int(match.group(1), 16))
     return inodes
+
+
+def journal_lines(pid):
+    """The commands typed in a shell, from the journal the bash hook keeps."""
+    path = os.path.join(JOURNAL_DIR, "%d-%d" % (pid, process_starttime(pid)))
+    if not os.path.exists(path):
+        return []
+    with open(path) as handle:
+        return handle.read().splitlines()
 
 
 def launch_extras(window):
@@ -767,6 +803,8 @@ def print_window(window):
         print("    in %s" % where)
     if window.get("shell_command"):
         print("    was running %s" % window["shell_command"])
+    if window.get("shell_history"):
+        print("    with %d commands of its own" % len(window["shell_history"]))
 
 
 def process_info(pid):
@@ -1028,11 +1066,12 @@ def shell_children(pid):
     return sorted(shells, key=lambda s: process_starttime(s["pid"]))
 
 
-def spawn(cmdline, cwd):
+def spawn(cmdline, cwd, env=None):
     try:
         with open(os.devnull, "wb") as sink:
             subprocess.Popen(cmdline, cwd=cwd, stdout=sink, stderr=sink,
-                             stdin=subprocess.DEVNULL, start_new_session=True)
+                             stdin=subprocess.DEVNULL, start_new_session=True,
+                             env=env)
     except OSError:
         return False
     time.sleep(1.5)

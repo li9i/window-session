@@ -13,6 +13,7 @@ import json
 import multiprocessing
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,8 +21,10 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 
-SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                      os.pardir, "bin", "window-session")
+REPOSITORY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          os.pardir)
+SCRIPT = os.path.join(REPOSITORY, "bin", "window-session")
+HOOK = os.path.join(REPOSITORY, "share", "window-session", "history.bash")
 
 
 def load_script():
@@ -41,14 +44,17 @@ class WindowSessionTest(unittest.TestCase):
         self.ws.STATE_FILE = os.path.join(self.tmp.name, "state.json")
         self.desktop = []
         self.spawned = []
+        self.environments = []
+        self.ws.JOURNAL_DIR = os.path.join(self.tmp.name, "journals")
         self.ws.read_windows = lambda: [dict(w) for w in self.desktop]
         self.ws.session_start_time = lambda: 1.0
         self.ws.annotate_folders = lambda windows, state: None
         self.ws.annotate_shell_dirs = lambda windows: None
         self.ws.spawn = self.fake_spawn
 
-    def fake_spawn(self, command, cwd):
+    def fake_spawn(self, command, cwd, env=None):
         self.spawned.append(command)
+        self.environments.append(env)
         return True
 
     def program(self, name):
@@ -391,6 +397,90 @@ class TabRestoreTest(WindowSessionTest):
         self.run_cli("store", "work")
         self.run_cli("restore", "work", "--go")
         self.assertEqual(self.spawned, [])
+
+
+class TerminalHistoryTest(WindowSessionTest):
+
+    def terminal(self, *commands):
+        return self.window("Mate-terminal", "mate-terminal",
+                           shell_cwd="/b", shell_history=list(commands))
+
+    def test_the_journal_of_a_shell_is_read_by_its_process(self):
+        pid = os.getpid()
+        os.makedirs(self.ws.JOURNAL_DIR)
+        name = "%d-%d" % (pid, self.ws.process_starttime(pid))
+        with open(os.path.join(self.ws.JOURNAL_DIR, name), "w") as handle:
+            handle.write("ls\nmake\n")
+        self.assertEqual(self.ws.journal_lines(pid), ["ls", "make"])
+
+    def test_a_shell_without_a_journal_has_no_commands(self):
+        self.assertEqual(self.ws.journal_lines(os.getpid()), [])
+
+    def test_a_restored_terminal_is_handed_the_commands_typed_in_it(self):
+        self.desktop = [self.terminal("ls", "make")]
+        self.run_cli("store", "work")
+        self.desktop = []
+        self.run_cli("restore", "work", "--go")
+        path = self.environments[0]["WINDOW_SESSION_HISTORY"]
+        with open(path) as handle:
+            self.assertEqual(handle.read().splitlines(), ["ls", "make"])
+
+    def test_a_new_command_alone_renews_the_crash_record(self):
+        self.desktop = [self.terminal("ls")]
+        self.run_cli("save")
+        self.desktop = [self.terminal("ls", "make")]
+        self.run_cli("save")
+        _, out = self.run_cli("restore", "--current")
+        self.assertIn("2 commands", out)
+
+
+class JournalHookTest(unittest.TestCase):
+    """The bash hook, driven through a real interactive bash."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.journals = os.path.join(
+            self.tmp.name, ".local", "state", "window-session", "journals")
+        rc = os.path.join(self.tmp.name, "rc")
+        with open(rc, "w") as handle:
+            handle.write(". %s\nPROMPT_COMMAND=_window_session_journal\n"
+                         % HOOK)
+        with open(os.path.join(self.tmp.name, ".bash_history"), "w") as h:
+            h.write("echo shared\n")
+        self.rc = rc
+
+    def bash(self, commands, **env):
+        environment = dict(os.environ, HOME=self.tmp.name, **env)
+        return subprocess.run(
+            ["bash", "--rcfile", self.rc, "-i"], input=commands, text=True,
+            capture_output=True, env=environment).stdout
+
+    def journal(self):
+        names = os.listdir(self.journals)
+        self.assertEqual(len(names), 1)
+        with open(os.path.join(self.journals, names[0])) as handle:
+            return handle.read().splitlines()
+
+    def test_each_command_goes_into_the_journal_of_its_shell(self):
+        self.bash("echo one\necho two\n")
+        self.assertEqual(self.journal(), ["echo one", "echo two"])
+
+    def test_the_journal_is_named_after_the_shell_process(self):
+        out = self.bash('echo "journal $$-$(cut -d" " -f22 /proc/$$/stat)"\n')
+        name = [l for l in out.splitlines() if l.startswith("journal ")][0]
+        self.assertEqual(os.listdir(self.journals), [name.split()[1]])
+
+    def test_a_restored_shell_has_its_commands_on_top_of_the_shared_ones(self):
+        handed = os.path.join(self.tmp.name, "restore-1")
+        with open(handed, "w") as handle:
+            handle.write("echo old\n")
+        out = self.bash("history\n", WINDOW_SESSION_HISTORY=handed)
+        listed = [l.split(None, 1)[1] for l in out.splitlines()
+                  if l.strip()[:1].isdigit()]
+        self.assertEqual(listed, ["echo shared", "echo old", "history"])
+        self.assertEqual(self.journal(), ["echo old", "history"])
+        self.assertFalse(os.path.exists(handed))
 
 
 if __name__ == "__main__":

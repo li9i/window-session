@@ -5,6 +5,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 COMPLETION_DIR="$HOME/.local/share/bash-completion/completions"
+SHARE_DIR="$HOME/.local/share/window-session"
 UNIT_DIR="$HOME/.config/systemd/user"
 SERVICE="window-session-save.service"
 TIMER="window-session-save.timer"
@@ -44,6 +45,7 @@ unlink_ours "$BIN_DIR/window-session"
 unlink_ours "$UNIT_DIR/$SERVICE"
 unlink_ours "$UNIT_DIR/$TIMER"
 unlink_ours "$COMPLETION_DIR/window-session"
+unlink_ours "$SHARE_DIR/history.bash"
 systemctl --user daemon-reload
 
 say "Done"

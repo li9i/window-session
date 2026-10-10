@@ -9,6 +9,7 @@ Everything lives in one file, `~/.local/state/window-session.json`, checked ever
 * [Commands](#commands)
 * [The two records](#the-two-records)
 * [Stored states](#stored-states)
+* [Terminal commands](#terminal-commands)
 * [What comes back and what does not](#what-comes-back-and-what-does-not)
 * [How it works](#how-it-works)
 * [Checks after a change](#checks-after-a-change)
@@ -21,7 +22,7 @@ git clone https://github.com/li9i/window-session.git ~/window-session
 ~/window-session/install.sh
 ```
 
-- The installer fetches `x11-utils`, `xdotool` and `procps` on Ubuntu, links the command, the systemd timer and its tab completion into the home directory pointing back at the checkout, and starts the timer. Nothing is copied anywhere.
+- The installer fetches `x11-utils`, `xdotool` and `procps` on Ubuntu, links the command, the systemd timer, its tab completion and the bash hook for [terminal commands](#terminal-commands) into the home directory pointing back at the checkout, and starts the timer. Nothing is copied anywhere.
 - To update, `git pull` and run the installer again. The second run is what makes a running timer take a changed schedule.
 - `~/window-session/uninstall.sh` stops the timer and takes the links back out. It leaves the checkout, the packages and the record where they are.
 - `~/.local/bin` has to be on your `PATH` for the command, though not for the timer. Ubuntu's stock `~/.profile` puts it there at login once the directory exists, so a fresh machine wants one log out and back in.
@@ -114,6 +115,21 @@ What comes back is what comes back after a crash, which the next section lists, 
 
 Stored states live in the same file, under `stored`.
 
+## Terminal commands
+
+A restored terminal window can have the commands that were typed in it back on its up arrow, on top of the shared history every new window starts with. That takes a hook in bash, which the installer links to `~/.local/share/window-session/history.bash` and which is turned on with two lines in `~/.bashrc`:
+
+```bash
+. ~/.local/share/window-session/history.bash
+PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_window_session_journal"
+```
+
+If `~/.bashrc` already times commands with a `DEBUG` trap that compares each command with `PROMPT_COMMAND`, call `_window_session_journal` from inside the function `PROMPT_COMMAND` runs instead, or every prompt starts that timer again.
+
+The hook writes each command into a journal of its own shell under `~/.local/state/window-session/journals/`, named after the process id and the start time of the shell. Every record takes the journal of each terminal window along, and a new command is enough to renew the crash record at the next tick of the timer. On restore, the commands go into a file that the new shell reads at its first prompt and then deletes. Bash reads its own history file only after `~/.bashrc`, which is why the commands wait for the first prompt: read any earlier, the shared history would land on top of them.
+
+What stays as it was: a new window starts with the shared history, which each window adds to only when it closes. A command that starts with a space, or that `HISTCONTROL` keeps out of the history, stays out of the journal too. The text that was on the screen does not come back: MATE's terminal keeps it in encrypted files whose key never leaves its memory. And the journals are never deleted, one small file for each shell that ran.
+
 ## What comes back and what does not
 
 Back:
@@ -123,10 +139,11 @@ Back:
 * the directory the shell in each terminal window was in
 * the folder each file manager window was showing
 * for a stored state, the tabs Chrome and Firefox had open
+* the commands typed in each terminal window, with the [bash hook](#terminal-commands)
 
 Not back, because it lives inside the program rather than in the window:
 
-* whatever was running in a terminal. The recorded command is printed as a reminder, not rerun. A `docker exec` into a container, or a Claude Code session, has to be started again by hand.
+* whatever was running in a terminal, and the text on its screen. The recorded command is printed as a reminder, not rerun. A `docker exec` into a container, or a Claude Code session, has to be started again by hand.
 * unsaved documents.
 
 After a crash, browsers and editors are left to their own restore. Chrome and Firefox are started once each and bring their own windows and tabs back themselves.
