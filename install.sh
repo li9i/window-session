@@ -9,6 +9,7 @@ SHARE_DIR="$HOME/.local/share/window-session"
 UNIT_DIR="$HOME/.config/systemd/user"
 SERVICE="window-session-save.service"
 TIMER="window-session-save.timer"
+PACKAGES=(x11-utils xdotool procps)
 
 say() {
   printf '\n==> %s\n' "$1"
@@ -25,8 +26,19 @@ echo "Installing window-session from $REPO"
 
 say "1. Packages"
 if command -v apt-get >/dev/null 2>&1; then
-  echo "This needs root."
-  sudo apt-get install -y x11-utils xdotool procps
+  MISSING=()
+  for package in "${PACKAGES[@]}"; do
+    if [ "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null)" \
+        != installed ]; then
+      MISSING+=("$package")
+    fi
+  done
+  if [ "${#MISSING[@]}" -gt 0 ]; then
+    echo "This needs root."
+    sudo apt-get install -y "${MISSING[@]}"
+  else
+    echo "  already installed"
+  fi
 else
   echo "No apt-get here, so install these yourself:"
   echo "  xprop, xdotool and pgrep"
