@@ -2,7 +2,7 @@
 
 The [README](../README.md) covers installing and the everyday commands. This page holds the rest.
 
-Everything lives in one file, `~/.local/state/window-session.json`, checked every minute by a systemd user timer, and rewritten only when the window list has changed. It holds one entry per window: the program, the title, the workspace, the size and position, the directory a terminal was in and the folder a file manager was showing. After a crash, `window-session restore` reads it and starts what is missing. States stored by hand under a name go in the same file and stay there until deleted.
+Everything lives in one file, `~/.local/state/window-session.json`, checked every minute by a systemd user timer, and rewritten only when the window list has changed. It holds one entry per window: the program, the title, the workspace, the size and position, the directory a terminal was in, the Claude Code session it was running and the folder a file manager was showing. After a crash, `window-session restore` reads it and starts what is missing. States stored by hand under a name go in the same file and stay there until deleted.
 
 * [Install](#install)
 * [What it needs](#what-it-needs)
@@ -10,6 +10,7 @@ Everything lives in one file, `~/.local/state/window-session.json`, checked ever
 * [The two records](#the-two-records)
 * [Stored states](#stored-states)
 * [Terminal commands](#terminal-commands)
+* [Claude Code sessions](#claude-code-sessions)
 * [What comes back and what does not](#what-comes-back-and-what-does-not)
 * [How it works](#how-it-works)
 * [Checks after a change](#checks-after-a-change)
@@ -23,7 +24,7 @@ Everything lives in one file, `~/.local/state/window-session.json`, checked ever
 
 ## What it needs
 
-An X11 desktop with a window manager that publishes the standard window list on the root window, which nearly all of them do. Wayland is out. Python 3 with nothing beyond its standard library, `xprop`, `xdotool`, `pgrep`, and a systemd user session to run the timer.
+An X11 desktop with a window manager that publishes the standard window list on the root window, which nearly all of them do. Wayland is out. Python 3 with nothing beyond its standard library, `xprop`, `xdotool`, `pgrep`, and a systemd user session to run the timer. A [Claude Code session](#claude-code-sessions) in a container also needs `docker` to run without `sudo`.
 
 It was written for and is used on Ubuntu MATE. One part depends on that: the record of the previous session is told apart from the current one by the start time of the MATE session process, `mate-session`, or of its window manager, `marco`. On another desktop neither is found, so nothing is kept aside when a session ends, and after a crash the near empty new desktop is written over the only record within a minute.
 
@@ -116,6 +117,38 @@ The hook writes each command into a journal of its own shell under `~/.local/sta
 
 What stays as it was: a new window starts with the shared history, which each window adds to only when it closes. A command that starts with a space, or that `HISTCONTROL` keeps out of the history, stays out of the journal too. The text that was on the screen does not come back: MATE's terminal keeps it in encrypted files whose key never leaves its memory. The timer deletes the journal of a shell once the shell is gone. By then its commands are in the records, which are what a restore reads.
 
+## Claude Code sessions
+
+A terminal window that was running Claude Code comes back running it again, on the same conversation. That holds for Claude started in the window and for Claude started in a container that the window went into with `docker exec`. The dry run says what each window comes back with:
+
+```
+Mate-terminal: 2 window(s) recorded, 0 already open, start 2
+  /usr/bin/mate-terminal
+  - Fix the retry loop in the upload client
+    in /home/alex/projects/uploader
+    was running docker exec -it -u developer uploader-app-1 bash
+    comes back with claude --resume 0fcab278-6013-4072-b1a0-f354949ee454
+  - Review the upload client
+    in /home/alex/projects/uploader
+    was running claude
+    comes back with claude attach ceb4cbb3
+```
+
+The new window then runs, for Claude in a container:
+
+```
+bash -c "docker exec -it -u developer uploader-app-1 bash -c 'cd /home/alex/projects/uploader && claude --resume 0fcab278-6013-4072-b1a0-f354949ee454; exec bash'; exec bash"
+```
+
+Claude starts in the folder it ran in. When it quits, the shell it ran under takes over, in the container first and then in the window, as before. For Claude started in the window, the `docker exec` part is left out.
+
+* A session sent to the background comes back with `claude attach` and its job. Claude opens a background job that still runs, and one that was stopped, the same way.
+* The options Claude was started with come back too, less those that pick a session: `--resume`, `-r`, `--continue`, `-c`, `--session-id` and `--fork-session`. A prompt given on the command line would be sent again, so start Claude without one in a window you want back.
+* The window has to be a `mate-terminal`, `gnome-terminal`, `terminator` or `xfce4-terminal`, the terminals that take a command to run. In any other terminal the window comes back as a shell.
+* After a desktop crash, a container outlives the window, and so does the Claude that ran in it. Claude does not refuse a second copy of a session, and two copies would write to one conversation. So before it opens the window, `restore --go` looks for that Claude. Idle, it is stopped, and the new window takes the session over. At work, it is left alone, and the window opens in the container without Claude, with a line that says so. After a reboot the container starts again empty, so there is nothing to find.
+
+How the session is found. Claude keeps a note on each running session in `~/.claude/sessions/`, or under `CLAUDE_CONFIG_DIR` when that is set, named after the process id that Claude sees. In a container that is its id inside the container. The note names the session, its folder and, for a session sent to the background, the job. The timer looks for Claude among the processes under the shell of each terminal window and reads the note where Claude runs, through `docker exec` for a container. The processes of a container run under the shim of its runtime, which names the container. A `docker exec` in a window is paired with the first shell opened in a container after it, so two opened at the same moment can swap.
+
 ## What comes back and what does not
 
 Back:
@@ -126,10 +159,11 @@ Back:
 * the folder each file manager window was showing
 * for a stored state, the tabs Chrome and Firefox had open
 * the commands typed in each terminal window, with the [bash hook](#terminal-commands)
+* the Claude Code session each terminal window was running, in a container too: see [Claude Code sessions](#claude-code-sessions)
 
 Not back, because it lives inside the program rather than in the window:
 
-* whatever was running in a terminal, and the text on its screen. The recorded command is printed as a reminder, not rerun. A `docker exec` into a container, or a Claude Code session, has to be started again by hand.
+* whatever else was running in a terminal, and the text on its screen. The recorded command is printed as a reminder, not rerun. A `docker exec` into a container has to be started again by hand, unless Claude Code was running in it.
 * unsaved documents.
 
 After a crash, browsers and editors are left to their own restore. Chrome and Firefox are started once each and bring their own windows and tabs back themselves.
@@ -179,7 +213,7 @@ window-session save --force --verbose
 window-session restore
 ```
 
-The dry run should name every program that is open, with the right window count, a directory under each terminal window and a folder under each file manager window.
+The dry run should name every program that is open, with the right window count, a directory under each terminal window, a folder under each file manager window and the Claude command under each terminal window that runs Claude Code.
 
 `WINDOW_SESSION_FILE` moves the state file, which keeps a test out of the real record. To check a restore without disturbing the desktop, copy the state file, cut the copy down to the one window you want, and point the tool at it:
 

@@ -12,6 +12,8 @@ import io
 import json
 import multiprocessing
 import os
+import re
+import signal
 import struct
 import subprocess
 import sys
@@ -49,6 +51,7 @@ class WindowSessionTest(unittest.TestCase):
         self.ws.read_windows = lambda: [dict(w) for w in self.desktop]
         self.ws.session_start_time = lambda: 1.0
         self.ws.annotate_folders = lambda windows, state: None
+        self.annotate_shell_dirs = self.ws.annotate_shell_dirs
         self.ws.annotate_shell_dirs = lambda windows: None
         self.ws.spawn = self.fake_spawn
 
@@ -445,6 +448,186 @@ class TerminalHistoryTest(WindowSessionTest):
         self.run_cli("save")
         _, out = self.run_cli("restore", "--current")
         self.assertIn("2 commands", out)
+
+
+class ClaudeTest(WindowSessionTest):
+    """Terminal windows that were running Claude Code, faked from /proc up.
+
+    Every process has an id, a parent, a command line, a start time and a
+    terminal. Claude's note on a session is found by the id the process has
+    in its own namespace, on the host or, through docker exec, in the
+    container the process runs in.
+    """
+
+    TERMINAL = 10
+    SHIM = ["/usr/bin/containerd-shim-runc-v2", "-namespace", "moby",
+            "-id", "c0ffee", "-address", "/run/containerd/containerd.sock"]
+
+    def setUp(self):
+        super().setUp()
+        self.ws.annotate_shell_dirs = self.annotate_shell_dirs
+        self.processes = {}
+        self.notes = {}
+        self.ws.process_children = self.fake_children
+        self.ws.process_info = self.fake_info
+        self.ws.process_stat = self.fake_stat
+        self.ws.process_status = self.fake_status
+        self.ws.run = self.fake_run
+        kill = mock.patch("os.kill")
+        self.killed = kill.start()
+        self.addCleanup(kill.stop)
+        self.process(self.TERMINAL, 1, ["mate-terminal"])
+
+    def process(self, pid, parent, argv, start=0, tty=0, inner=None):
+        self.processes[pid] = {"parent": parent, "argv": argv, "start": start,
+                               "tty": tty, "inner": inner or pid}
+
+    def note(self, pid, container=None, **note):
+        inner = self.processes[pid]["inner"]
+        self.notes[(container, inner)] = dict({"status": "idle"}, **note)
+
+    def fake_children(self):
+        children = {}
+        for pid in sorted(self.processes):
+            children.setdefault(self.processes[pid]["parent"], []).append(pid)
+        return children
+
+    def fake_info(self, pid):
+        process = self.processes.get(pid, {})
+        return {"cmdline": process.get("argv"), "cwd": "/home", "exe": None}
+
+    def fake_stat(self, pid):
+        process = self.processes.get(pid)
+        if not process:
+            return []
+        return (["S", str(process["parent"]), "0", "0", str(process["tty"])]
+                + ["0"] * 14 + [str(process["start"])])
+
+    def fake_status(self, pid):
+        ids = [pid, self.processes[pid]["inner"]]
+        return {"NSpid": "\t".join(str(i) for i in ids),
+                "Uid": "1000\t1000\t1000\t1000"}
+
+    def fake_run(self, command):
+        container = command[4] if command[0] == "docker" else None
+        inner = int(re.search(r"sessions/(\d+)\.json", command[-1]).group(1))
+        note = self.notes.get((container, inner))
+        return json.dumps(note) if note else None
+
+    def terminal(self):
+        return self.window("Mate-terminal", "mate-terminal",
+                           pid=self.TERMINAL)
+
+    def restored(self, windows=1):
+        self.desktop = [self.terminal() for _ in range(windows)]
+        self.run_cli("store", "work")
+        self.desktop = []
+        _, self.out = self.run_cli("restore", "work", "--go")
+        return [command[command.index("-x") + 1:] if "-x" in command else []
+                for command in self.spawned]
+
+    def container_claude(self, status):
+        self.process(11, self.TERMINAL, ["bash"])
+        self.process(12, 11, ["docker", "exec", "-it", "app-1", "bash"],
+                     start=5)
+        self.process(20, 1, self.SHIM)
+        self.process(21, 20, ["dumb-init"], start=1)
+        self.process(22, 20, ["bash"], start=6, tty=1)
+        self.process(23, 22, ["claude"], inner=700)
+        self.note(23, container="c0ffee", sessionId="s-2", cwd="/work",
+                  status=status)
+
+    def test_claude_on_the_host_comes_back_resumed_in_its_folder(self):
+        self.process(11, self.TERMINAL, ["bash"])
+        self.process(12, 11, ["claude"])
+        self.process(13, 12, ["python3", "tool.py"])
+        self.note(12, sessionId="s-1", cwd="/work")
+        self.assertEqual(self.restored(), [
+            ["bash", "-c", "cd /work && claude --resume s-1; exec bash"]])
+
+    def test_claude_sent_to_the_background_comes_back_attached(self):
+        self.process(11, self.TERMINAL, ["bash"])
+        self.process(12, 11, ["claude"])
+        self.note(12, sessionId="s-1", cwd="/work", parkedJobId="job1")
+        self.assertEqual(self.restored(), [
+            ["bash", "-c", "cd /work && claude attach job1; exec bash"]])
+
+    def test_claude_in_a_container_comes_back_through_the_same_exec(self):
+        self.process(11, self.TERMINAL, ["bash"])
+        self.process(12, 11, ["docker", "exec", "-it", "-u", "developer",
+                              "app-1", "bash"], start=5)
+        self.process(20, 1, self.SHIM)
+        self.process(21, 20, ["dumb-init"], start=1)
+        self.process(22, 20, ["bash"], start=6, tty=34820)
+        self.process(23, 22, ["claude"], inner=700)
+        self.note(23, container="c0ffee", sessionId="s-2", cwd="/work")
+        self.assertEqual(self.restored(), [[
+            "bash", "-c",
+            "docker exec -it -u developer app-1 bash -c "
+            "'cd /work && claude --resume s-2; exec bash'; exec bash"]])
+
+    def test_each_docker_exec_gets_the_container_shell_it_opened(self):
+        exec_into = ["docker", "exec", "-it", "app-1", "bash"]
+        self.process(11, self.TERMINAL, ["bash"], start=1)
+        self.process(12, 11, exec_into, start=5)
+        self.process(13, self.TERMINAL, ["bash"], start=2)
+        self.process(14, 13, exec_into, start=7)
+        self.process(20, 1, self.SHIM)
+        self.process(21, 20, ["dumb-init"], start=1)
+        self.process(22, 20, ["bash"], start=6, tty=1)
+        self.process(23, 20, ["bash"], start=8, tty=2)
+        self.process(24, 22, ["claude"], inner=700)
+        self.process(25, 23, ["claude"], inner=701)
+        self.note(24, container="c0ffee", sessionId="first", cwd="/a")
+        self.note(25, container="c0ffee", sessionId="second", cwd="/b")
+        scripts = [command[-1] for command in self.restored(windows=2)]
+        self.assertIn("--resume first", scripts[0])
+        self.assertIn("--resume second", scripts[1])
+
+    def test_an_idle_claude_left_in_the_container_is_stopped_first(self):
+        self.container_claude("idle")
+        script = self.restored()[0][-1]
+        self.killed.assert_called_once_with(23, signal.SIGHUP)
+        self.assertIn("claude --resume s-2;", script)
+
+    def test_a_busy_claude_left_in_the_container_is_left_at_its_work(self):
+        self.container_claude("busy")
+        self.assertEqual(self.restored(), [[]])
+        self.killed.assert_not_called()
+        self.assertIn("still works on session s-2", self.out)
+
+    def test_options_that_pick_a_session_are_dropped_and_others_kept(self):
+        self.process(11, self.TERMINAL, ["bash"])
+        self.process(12, 11, ["claude", "--resume", "old", "--fork-session",
+                              "--plugin-dir", "/p"])
+        self.note(12, sessionId="s-1", cwd="/work")
+        script = self.restored()[0][-1]
+        self.assertIn("claude --resume s-1 --plugin-dir /p;", script)
+
+    def test_a_terminal_without_claude_comes_back_as_a_shell(self):
+        self.process(11, self.TERMINAL, ["bash"])
+        self.process(12, 11, ["make"])
+        self.assertEqual(self.restored(), [[]])
+
+    def test_a_dry_run_names_the_command_claude_comes_back_with(self):
+        self.process(11, self.TERMINAL, ["bash"])
+        self.process(12, 11, ["claude"])
+        self.note(12, sessionId="s-1", cwd="/work", parkedJobId="job1")
+        self.desktop = [self.terminal()]
+        self.run_cli("store", "work")
+        _, out = self.run_cli("restore", "work")
+        self.assertIn("comes back with claude attach job1", out)
+
+    def test_a_new_claude_session_alone_renews_the_crash_record(self):
+        self.process(11, self.TERMINAL, ["bash"])
+        self.process(12, 11, ["claude"])
+        self.note(12, sessionId="s-1", cwd="/work")
+        self.desktop = [self.terminal()]
+        self.run_cli("save")
+        self.note(12, sessionId="s-1", cwd="/work", parkedJobId="job1")
+        self.run_cli("save")
+        _, out = self.run_cli("restore", "--current")
+        self.assertIn("claude attach job1", out)
 
 
 class JournalHookTest(unittest.TestCase):

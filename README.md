@@ -2,7 +2,7 @@
 
 `window-session` records which windows are open and puts them back after a crash or a reboot.
 
-A systemd user timer saves the open windows to `~/.local/state/window-session.json` every minute. After a crash, `window-session restore` starts what is missing. A desktop can also be stored under a name and put back days later.
+A systemd user timer saves the open windows to `~/.local/state/window-session.json` every minute. After a crash, `window-session restore` starts what is missing. A desktop can also be stored under a name and put back days later. A terminal window that was running [Claude Code](docs/details.md#claude-code-sessions) comes back running it on the same conversation, in a docker container too.
 
 The details, from what comes back to how to test a change, are in [docs/details.md](docs/details.md).
 

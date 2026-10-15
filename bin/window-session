@@ -12,7 +12,7 @@ Beside those two it holds the states stored by hand, each under a name and with
 a description if one was given. They stay until deleted, so a desktop stored
 today can be put back days and many reboots later.
 
-Two extras are worked out while the programs are still alive, because the
+Three extras are worked out while the programs are still alive, because the
 information is gone once they die:
 
   Terminal windows get the working directory of the shell running in them.
@@ -24,6 +24,12 @@ information is gone once they die:
   holds on the folder it displays: the watch gives an inode, and a scan of the
   home directory turns that inode into a path. Resolved paths are cached in
   the same file.
+
+  Terminal windows running Claude Code get the session it runs, from the note
+  Claude keeps on each running session. Claude in a container is reached
+  through the docker exec in the window. The shell that docker exec opened in
+  the container is the first one opened after it, so with two opened at the
+  same moment the pairing can slip too.
 
 Usage:
   window-session save [--force]
@@ -61,7 +67,10 @@ What comes back: the programs, how many windows each had, their workspace,
 their size, a terminal's directory and a file manager's folder. Not the state
 inside them. Browsers and editors restore their own tabs and documents. A
 terminal comes back as a fresh shell, so the recorded window titles and the
-commands that were running are printed as a reminder.
+commands that were running are printed as a reminder. The one exception is
+Claude Code: its session starts again where it ran, in a container too. A
+Claude that a crash left running in a container is stopped first when idle,
+and left at its work, with the window opened without Claude, when not.
 """
 
 import argparse
@@ -73,7 +82,9 @@ import json
 import os
 import random
 import re
+import shlex
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -109,6 +120,27 @@ BROWSER_OPEN = {
 # and the variable that hands a restored shell the commands of its window.
 JOURNAL_DIR = os.path.expanduser("~/.local/state/window-session/journals")
 HISTORY_ENV = "WINDOW_SESSION_HISTORY"
+
+# Claude Code keeps a note on each running session, named after the process id
+# in its own namespace. The note names the session, the folder it runs in and,
+# once the session was sent to the background, the job that holds it.
+CLAUDE = "claude"
+CLAUDE_NOTE = 'cat "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions/%s.json"'
+
+# The status in the note of a session that waits for the next prompt. A Claude
+# left running in it loses no work when it is stopped.
+CLAUDE_IDLE = "idle"
+
+# The options of Claude Code that pick a session, dropped when the session is
+# resumed, each with whether it takes a value. The value of --resume can be
+# left out, and then it opens a picker.
+CLAUDE_SESSION_OPTIONS = {"--continue": False, "--fork-session": False,
+                          "--resume": True, "--session-id": True,
+                          "-c": False, "-r": True}
+
+# The processes of a container run under a shim of its runtime, which names
+# the container after -id.
+CONTAINER_SHIM = "containerd-shim"
 
 # Directories searched for an AppImage when the recorded path was a temporary
 # mount point that no longer exists.
@@ -188,6 +220,14 @@ TERMINAL_CWD_OPTION = {
     "xfce4-terminal": "--default-working-directory",
 }
 
+# Terminals that run the rest of their command line in the new window.
+TERMINAL_RUN_OPTION = {
+    "gnome-terminal": "--",
+    "mate-terminal": "-x",
+    "terminator": "-x",
+    "xfce4-terminal": "-x",
+}
+
 
 def annotate_folders(windows, state):
     """Record the folder each file manager window is showing."""
@@ -224,16 +264,21 @@ def annotate_folders(windows, state):
 
 
 def annotate_shell_dirs(windows):
-    """Record the directory of the shell running in each terminal window."""
+    """Record the shell running in each terminal window, and Claude in it."""
+    children = process_children()
+    containers = container_shells(children)
     by_pid = {}
     for window in windows:
         if program_name(window) in TERMINAL_CWD_OPTION and window.get("pid"):
             by_pid.setdefault(window["pid"], []).append(window)
     for pid, group in by_pid.items():
-        for window, shell in zip(group, shell_children(pid)):
+        for window, shell in zip(group, shell_children(pid, children)):
             window["shell_cwd"] = shell["cwd"]
             window["shell_command"] = shell["command"]
             window["shell_history"] = journal_lines(shell["pid"])
+            claude = claude_record(shell, children, containers)
+            if claude:
+                window["claude"] = claude
 
 
 def appimage_for(name):
@@ -262,6 +307,7 @@ def change_key(windows):
             w.get("folder") or "",
             w.get("shell_cwd") or "",
             str(len(w.get("shell_history") or [])),
+            json.dumps(w.get("claude"), sort_keys=True),
             str(w.get("desktop")),
             json.dumps(w.get("geometry"), sort_keys=True),
         )
@@ -274,6 +320,124 @@ def chosen_record(state, args):
     if args.name:
         return state["stored"][args.name]
     return pick_record(state, wanted_record(args))
+
+
+def claude_in(chain):
+    """The first Claude among the processes, or None."""
+    found = [p for p in chain if program_name(process_info(p)) == CLAUDE]
+    return found[0] if found else None
+
+
+def claude_launch(claude):
+    """The command that brings a Claude session back in a new terminal window.
+
+    Claude starts in its folder, under the shell it ran under, and that shell
+    takes over when Claude quits. In a container, the same docker exec opens
+    the container shell first, and the shell of the window takes over after.
+    """
+    layers = [([], claude["shell"])]
+    if "docker" in claude:
+        layers.append((claude["docker"], claude["docker_shell"]))
+    script = "cd %s && %s" % (shlex.quote(claude["cwd"]),
+                              shlex.join(claude["args"]))
+    for prefix, shell in reversed(layers):
+        command = prefix + shell + [
+            "-c", "%s; exec %s" % (script, shlex.join(shell))]
+        script = shlex.join(command)
+    return command
+
+
+def claude_leftover(window):
+    """The window to start, once the Claude it left running is dealt with.
+
+    After a desktop crash, the Claude that docker exec started in a container
+    keeps running, as the container outlives the window. Resumed beside it,
+    two would write to one conversation. Idle, it is stopped. At work, it is
+    left alone and the window opens without Claude.
+    """
+    claude = window.get("claude")
+    if not (claude and "docker" in claude):
+        return window
+    children = process_children()
+    for _, pid, container in container_shells(children):
+        found = claude_in(process_chain(pid, children))
+        note = found and claude_session(found, container)
+        if not note or note["sessionId"] != claude["session"]:
+            continue
+        if note["status"] == CLAUDE_IDLE:
+            os.kill(found, signal.SIGHUP)
+            print("  stopped the idle Claude left running on session %s"
+                  % claude["session"])
+            return window
+        print("  Claude still works on session %s in its container, so the "
+              "window opens without it" % claude["session"])
+        return dict(window, claude=None)
+    return window
+
+
+def claude_options(args):
+    """The options Claude was started with, less those that pick a session."""
+    kept = []
+    rest = list(args)
+    while rest:
+        arg = rest.pop(0)
+        takes_value = CLAUDE_SESSION_OPTIONS.get(arg)
+        if takes_value is None:
+            kept.append(arg)
+        elif takes_value and rest and not rest[0].startswith("-"):
+            rest.pop(0)
+    return kept
+
+
+def claude_record(shell, children, containers):
+    """The Claude session running in a terminal shell, and the way to it.
+
+    Claude runs under the shell, or in a container under the shell that a
+    docker exec in the window opened there. That container shell is taken out
+    of the containers, so a second docker exec does not get it too.
+    """
+    record = {"shell": shell["argv"]}
+    chain = shell["chain"]
+    container = None
+    client = process_info(chain[-1])["cmdline"] or []
+    if client and os.path.basename(client[0]) == "docker" \
+            and client[1:2] == ["exec"]:
+        start = process_starttime(chain[-1])
+        opened = next((c for c in containers if c[0] >= start), None)
+        if not opened:
+            return None
+        containers.remove(opened)
+        _, pid, container = opened
+        chain = process_chain(pid, children)
+        inner = process_info(pid)["cmdline"]
+        record["docker"] = client[:-len(inner)]
+        record["docker_shell"] = inner
+
+    found = claude_in(chain)
+    if not found:
+        return None
+    note = claude_session(found, container)
+    if not note:
+        return None
+    argv = process_info(found)["cmdline"]
+    if note.get("parkedJobId"):
+        record["args"] = [argv[0], "attach", note["parkedJobId"]]
+    else:
+        record["args"] = ([argv[0], "--resume", note["sessionId"]]
+                          + claude_options(argv[1:]))
+    record["cwd"] = note["cwd"]
+    record["session"] = note["sessionId"]
+    return record
+
+
+def claude_session(pid, container):
+    """Claude's note on the session a process runs, read where it runs."""
+    status = process_status(pid)
+    where = []
+    if container:
+        where = ["docker", "exec", "-u", status["Uid"].split()[0], container]
+    out = run(where + ["sh", "-c", CLAUDE_NOTE % status["NSpid"].split()[-1]])
+    return json.loads(out) if out else None
 
 
 def cmd_delete(args):
@@ -377,6 +541,7 @@ def cmd_restore(args):
 
         if args.go:
             for window in to_start:
+                window = claude_leftover(window)
                 command = program + launch_extras(window)
                 cwd = window.get("shell_cwd") or group["cwd"]
                 if not (cwd and os.path.isdir(cwd)):
@@ -457,6 +622,9 @@ def cmd_show(args):
             print("               in %s" % where)
         if window.get("shell_command"):
             print("               was running %s" % window["shell_command"])
+        if window.get("claude"):
+            print("               comes back with %s"
+                  % shlex.join(window["claude"]["args"]))
         if window.get("shell_history"):
             print("               with %d commands of its own"
                   % len(window["shell_history"]))
@@ -479,6 +647,26 @@ def cmd_store(args):
         save_state(state)
     print("stored %d windows as %s" % (len(record["windows"]), name))
     return 0
+
+
+def container_shells(children):
+    """The shells docker exec opened in containers, oldest first.
+
+    They are the processes on a terminal that the shim of a container runs,
+    all but the oldest, which is the first process of the container itself.
+    Each comes with its start time and the id of its container.
+    """
+    shells = []
+    for parent, kids in children.items():
+        argv = process_info(parent)["cmdline"] or []
+        if not argv or not os.path.basename(argv[0]).startswith(
+                CONTAINER_SHIM):
+            continue
+        container = argv[argv.index("-id") + 1]
+        for kid in sorted(kids, key=process_starttime)[1:]:
+            if process_tty(kid):
+                shells.append((process_starttime(kid), kid, container))
+    return sorted(shells)
 
 
 def group_by_process(windows):
@@ -551,10 +739,13 @@ def launch_extras(window):
     name = program_name(window)
     if name in FILE_MANAGERS and window.get("folder"):
         return [window["folder"]]
+    extras = []
     option = TERMINAL_CWD_OPTION.get(name)
     if option and window.get("shell_cwd"):
-        return ["%s=%s" % (option, window["shell_cwd"])]
-    return []
+        extras.append("%s=%s" % (option, window["shell_cwd"]))
+    if name in TERMINAL_RUN_OPTION and window.get("claude"):
+        extras += [TERMINAL_RUN_OPTION[name]] + claude_launch(window["claude"])
+    return extras
 
 
 def load_state(path):
@@ -804,8 +995,29 @@ def print_window(window):
         print("    in %s" % where)
     if window.get("shell_command"):
         print("    was running %s" % window["shell_command"])
+    if window.get("claude"):
+        print("    comes back with %s" % shlex.join(window["claude"]["args"]))
     if window.get("shell_history"):
         print("    with %d commands of its own" % len(window["shell_history"]))
+
+
+def process_chain(pid, children):
+    """The process, its last child, that child's last child, and so on."""
+    chain = [pid]
+    while children.get(chain[-1]):
+        chain.append(children[chain[-1]][-1])
+    return chain
+
+
+def process_children():
+    """The ids of the children of each process, by the id of the process."""
+    children = {}
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            fields = process_stat(int(entry))
+            if fields:
+                children.setdefault(int(fields[1]), []).append(int(entry))
+    return children
 
 
 def process_info(pid):
@@ -830,10 +1042,35 @@ def process_info(pid):
 def process_starttime(pid):
     """Process start time in clock ticks since boot, so newer means larger."""
     try:
+        return int(process_stat(pid)[19])
+    except (IndexError, ValueError):
+        return 0
+
+
+def process_stat(pid):
+    """The fields of /proc/PID/stat after the command name, if it runs."""
+    try:
         with open("/proc/%d/stat" % pid) as handle:
-            fields = handle.read().rpartition(")")[2].split()
-        return int(fields[19])
-    except (OSError, IndexError, ValueError):
+            return handle.read().rpartition(")")[2].split()
+    except OSError:
+        return []
+
+
+def process_status(pid):
+    """The lines of /proc/PID/status, by name, if it runs."""
+    try:
+        with open("/proc/%d/status" % pid) as handle:
+            return dict(line.rstrip("\n").split(":\t", 1)
+                        for line in handle if ":\t" in line)
+    except OSError:
+        return {}
+
+
+def process_tty(pid):
+    """The terminal device of the process, 0 when it has none."""
+    try:
+        return int(process_stat(pid)[4])
+    except (IndexError, ValueError):
         return 0
 
 
@@ -1030,40 +1267,26 @@ def session_start_time():
     return None
 
 
-def shell_children(pid):
+def shell_children(pid, children):
     """Shells running under a terminal process, oldest first.
 
     The command reported for each shell is its deepest descendant, which is
     what the operator was actually looking at.
     """
-    children = {}
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            with open("/proc/%s/stat" % entry) as handle:
-                fields = handle.read().rpartition(")")[2].split()
-            parent = int(fields[1])
-        except (OSError, IndexError, ValueError):
-            continue
-        children.setdefault(parent, []).append(int(entry))
-
     shells = []
     for child in children.get(pid, []):
         info = process_info(child)
         cmdline = info["cmdline"] or []
         if not cmdline or os.path.basename(cmdline[0]) not in SHELLS:
             continue
-        deepest, current = cmdline, child
-        while children.get(current):
-            current = children[current][-1]
-            found = process_info(current)["cmdline"]
-            if found:
-                deepest = found
+        chain = process_chain(child, children)
+        commands = [process_info(p)["cmdline"] for p in chain]
         shells.append({
             "pid": child,
             "cwd": info["cwd"],
-            "command": " ".join(deepest),
+            "argv": cmdline,
+            "chain": chain,
+            "command": " ".join([c for c in commands if c][-1]),
         })
     return sorted(shells, key=lambda s: process_starttime(s["pid"]))
 
